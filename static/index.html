@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能体 - 流式演示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 24px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .session-bar {
+            background: #f5f5f5;
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .session-info {
+            font-size: 13px;
+            color: #666;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .session-id {
+            font-family: monospace;
+            background: #e8e8e8;
+            padding: 4px 8px;
+            border-radius: 4px;
+            color: #333;
+        }
+        
+        .session-actions {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .btn-small {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-outline {
+            background: transparent;
+            border: 1px solid #667eea;
+            color: #667eea;
+        }
+        
+        .btn-outline:hover {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-danger {
+            background: #ffebee;
+            color: #f44336;
+            border: 1px solid #f44336;
+        }
+        
+        .btn-danger:hover {
+            background: #f44336;
+            color: white;
+        }
+        
+        .input-area {
+            padding: 24px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .input-group {
+            display: flex;
+            gap: 12px;
+        }
+        
+        #queryInput {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        #queryInput:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .options {
+            display: flex;
+            gap: 16px;
+            margin-top: 12px;
+        }
+        
+        .option-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .chat-history {
+            padding: 24px;
+            min-height: 300px;
+            max-height: 500px;
+            overflow-y: auto;
+            background: #fafafa;
+        }
+        
+        .message {
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 80%;
+        }
+        
+        .message.user {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-left: auto;
+        }
+        
+        .message.assistant {
+            background: white;
+            border: 1px solid #e0e0e0;
+            color: #333;
+        }
+        
+        .message.system {
+            background: #fff3e0;
+            border: 1px solid #ffe0b2;
+            color: #e65100;
+            font-size: 13px;
+            max-width: 100%;
+        }
+        
+        .message-label {
+            font-size: 12px;
+            opacity: 0.7;
+            margin-bottom: 4px;
+        }
+        
+        .message-content {
+            font-size: 15px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .thinking-content {
+            font-size: 13px;
+            color: #999;
+            font-style: italic;
+            padding: 8px;
+            background: #f5f5f5;
+            border-radius: 6px;
+            margin-top: 8px;
+        }
+        
+        .tool-call {
+            font-size: 13px;
+            color: #667eea;
+            padding: 8px;
+            background: #e8eaf6;
+            border-radius: 6px;
+            margin-top: 8px;
+        }
+        
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 0;
+            font-size: 13px;
+            color: #666;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ccc;
+        }
+        
+        .status-dot.active {
+            background: #4caf50;
+            animation: pulse 1s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .typing-indicator {
+            display: inline-flex;
+            gap: 4px;
+            align-items: center;
+        }
+        
+        .typing-indicator span {
+            width: 6px;
+            height: 6px;
+            background: #667eea;
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+        
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        
+        @keyframes typing {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-4px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 智能体</h1>
+            <p>支持多轮对话和流式输出的智能对话系统</p>
+        </div>
+        
+        <div class="session-bar">
+            <div class="session-info">
+                <span>💬 会话 ID:</span>
+                <span class="session-id" id="sessionId">未连接</span>
+            </div>
+            <div class="session-actions">
+                <button class="btn-small btn-outline" onclick="copySessionId()">复制 ID</button>
+                <button class="btn-small btn-danger" onclick="clearHistory()">清空历史</button>
+            </div>
+        </div>
+        
+        <div class="input-area">
+            <div class="input-group">
+                <input type="text" id="queryInput" placeholder="输入你的问题，例如：北京天气怎么样？" 
+                       value="北京天气怎么样？" onkeypress="handleKeyPress(event)">
+                <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
+            </div>
+            <div class="options">
+                <label class="option-label">
+                    <input type="checkbox" id="streamCheckbox" checked>
+                    启用流式输出
+                </label>
+                <label class="option-label">
+                    <input type="checkbox" id="thinkingCheckbox" checked>
+                    显示思考过程
+                </label>
+            </div>
+        </div>
+        
+        <div class="chat-history" id="chatHistory">
+            <div class="message system">
+                <div class="message-content">👋 你好！我是智能助手。我可以帮你查询天气、地图等信息。请问有什么可以帮你的？</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 会话管理
+        let sessionId = localStorage.getItem('agent_session_id') || null;
+        let messageHistory = [];  // 保存对话历史（OpenAI 格式）
+        
+        // 初始化
+        window.addEventListener('DOMContentLoaded', () => {
+            if (sessionId) {
+                updateSessionId(sessionId);
+                console.log('恢复会话 ID:', sessionId);
+            } else {
+                createNewSession();
+            }
+        });
+        
+        function updateSessionId(id) {
+            sessionId = id;
+            localStorage.setItem('agent_session_id', id);
+            document.getElementById('sessionId').textContent = id.substring(0, 8) + '...';
+        }
+        
+        function createNewSession() {
+            sessionId = 'new_' + Date.now();
+            updateSessionId(sessionId);
+            // 清空本地消息历史，但保留欢迎消息
+            messageHistory = [];
+            const chatHistory = document.getElementById('chatHistory');
+            chatHistory.innerHTML = `
+                <div class="message system">
+                    <div class="message-content">👋 你好！我是智能助手。我可以帮你查询天气、地图等信息。请问有什么可以帮你的？</div>
+                </div>
+            `;
+        }
+        
+        function copySessionId() {
+            navigator.clipboard.writeText(sessionId || '');
+            alert('会话 ID 已复制到剪贴板');
+        }
+        
+        function clearHistory() {
+            if (confirm('确定要清空对话历史吗？')) {
+                createNewSession();
+            }
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        function addMessage(role, content, thinkingContent = null, toolCall = null) {
+            const chatHistory = document.getElementById('chatHistory');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            let html = `<div class="message-label">${role === 'user' ? '👤 你' : '🤖 助手'}</div>`;
+            html += `<div class="message-content">${escapeHtml(content)}</div>`;
+            
+            if (thinkingContent) {
+                html += `<div class="thinking-content">💭 ${escapeHtml(thinkingContent)}</div>`;
+            }
+            
+            if (toolCall) {
+                html += `<div class="tool-call">🔧 使用工具：${escapeHtml(toolCall)}</div>`;
+            }
+            
+            messageDiv.innerHTML = html;
+            chatHistory.appendChild(messageDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+        
+        function addStatusMessage(text) {
+            const chatHistory = document.getElementById('chatHistory');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message system';
+            messageDiv.innerHTML = `<div class="message-content">${escapeHtml(text)}</div>`;
+            chatHistory.appendChild(messageDiv);
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+            return messageDiv;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        async function sendMessage() {
+            const query = document.getElementById('queryInput').value.trim();
+            const streamEnabled = document.getElementById('streamCheckbox').checked;
+            const sendBtn = document.getElementById('sendBtn');
+            
+            if (!query) {
+                alert('请输入查询内容');
+                return;
+            }
+            
+            // 添加用户消息到历史和显示
+            messageHistory.push({
+                role: 'user',
+                content: query
+            });
+            addMessage('user', query);
+            
+            // 清空输入框
+            document.getElementById('queryInput').value = '';
+            
+            // 禁用按钮
+            sendBtn.disabled = true;
+            
+            if (streamEnabled) {
+                await sendStreamRequest(query);
+            } else {
+                await sendNormalRequest(query);
+            }
+        }
+        
+        async function sendStreamRequest(query) {
+            const enableThinking = document.getElementById('thinkingCheckbox').checked;
+            let assistantMessageDiv = null;
+            let assistantContent = '';
+            let thinkingContent = '';
+            let toolCallInfo = null;
+            
+            try {
+                const statusMsg = addStatusMessage('📡 正在发送请求...');
+                
+                const response = await fetch('http://localhost:18000/api/chat/stream', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        messages: messageHistory,
+                        session_id: sessionId,
+                        enable_thinking: enableThinking
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                // 从响应头或第一个消息获取 session_id
+                const newSessionId = response.headers.get('X-Session-Id');
+                if (newSessionId && newSessionId !== sessionId) {
+                    updateSessionId(newSessionId);
+                }
+                
+                statusMsg.querySelector('.message-content').textContent = '📡 接收中...';
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                // 创建助手消息容器
+                assistantMessageDiv = document.createElement('div');
+                assistantMessageDiv.className = 'message assistant';
+                assistantMessageDiv.innerHTML = '<div class="message-label">🤖 助手</div><div class="message-content"><span class="typing-indicator"><span></span><span></span><span></span></span></div>';
+                document.getElementById('chatHistory').appendChild(assistantMessageDiv);
+                
+                const contentDiv = assistantMessageDiv.querySelector('.message-content');
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data.trim()) {
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    
+                                    // 更新 session_id
+                                    if (parsed.session_id && parsed.session_id !== sessionId) {
+                                        updateSessionId(parsed.session_id);
+                                    }
+                                    
+                                    // 处理不同类型的消息
+                                    switch (parsed.type) {
+                                        case 'status':
+                                            statusMsg.querySelector('.message-content').textContent = parsed.content;
+                                            break;
+                                            
+                                        case 'token':
+                                            assistantContent += parsed.content;
+                                            contentDiv.textContent = assistantContent;
+                                            document.getElementById('chatHistory').scrollTop = document.getElementById('chatHistory').scrollHeight;
+                                            break;
+                                            
+                                        case 'reasoning_content':
+                                            thinkingContent += parsed.content;
+                                            break;
+                                            
+                                        case 'tool_call':
+                                            toolCallInfo = parsed.name;
+                                            if (parsed.sub_tool) {
+                                                toolCallInfo += ' → ' + parsed.sub_tool;
+                                            }
+                                            break;
+                                            
+                                        case 'complete':
+                                            // 完成，添加思考和工具信息
+                                            let finalHtml = `<div class="message-label">🤖 助手</div><div class="message-content">${escapeHtml(assistantContent)}</div>`;
+                                            if (thinkingContent && enableThinking) {
+                                                finalHtml += `<div class="thinking-content">💭 ${escapeHtml(thinkingContent)}</div>`;
+                                            }
+                                            if (toolCallInfo) {
+                                                finalHtml += `<div class="tool-call">🔧 使用工具：${escapeHtml(toolCallInfo)}</div>`;
+                                            }
+                                            assistantMessageDiv.innerHTML = finalHtml;
+                                            
+                                            // 添加助手响应到历史
+                                            messageHistory.push({
+                                                role: 'assistant',
+                                                content: assistantContent
+                                            });
+                                            break;
+                                            
+                                        case 'error':
+                                            contentDiv.innerHTML = `<span style="color: #f44336;">❌ 错误：${escapeHtml(parsed.message)}</span>`;
+                                            break;
+                                    }
+                                } catch (e) {
+                                    console.log('解析数据失败:', e);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 移除状态消息
+                statusMsg.remove();
+                
+            } catch (error) {
+                addStatusMessage(`❌ 错误：${error.message}`);
+                if (assistantMessageDiv) {
+                    assistantMessageDiv.remove();
+                }
+            } finally {
+                document.getElementById('sendBtn').disabled = false;
+            }
+        }
+        
+        async function sendNormalRequest(query) {
+            const enableThinking = document.getElementById('thinkingCheckbox').checked;
+            
+            try {
+                const statusMsg = addStatusMessage('⏳ 处理中...');
+                
+                const response = await fetch('http://localhost:18000/api/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        messages: messageHistory,
+                        session_id: sessionId,
+                        enable_thinking: enableThinking
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                
+                // 更新 session_id
+                if (result.session_id && result.session_id !== sessionId) {
+                    updateSessionId(result.session_id);
+                }
+                
+                statusMsg.remove();
+                
+                // 显示结果
+                let resultContent = result.final_result || 'N/A';
+                let thinkingContent = result.result?.thinking_content || null;
+                
+                addMessage('assistant', resultContent, enableThinking ? thinkingContent : null);
+                
+                // 添加助手响应到历史
+                messageHistory.push({
+                    role: 'assistant',
+                    content: resultContent
+                });
+                
+            } catch (error) {
+                addStatusMessage(`❌ 错误：${error.message}`);
+            } finally {
+                document.getElementById('sendBtn').disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

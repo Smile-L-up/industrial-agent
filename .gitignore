@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Database
+data/
+*.db
+
+# Models
+*.bin
+*.pt
+*.safetensors
+
+# Docker
+*.tar
+
+# Large files
+zft@192.168.110.201
