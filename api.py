@@ -81,7 +81,8 @@ def get_or_create_session(session_id: Optional[str] = None) -> tuple:
     
     # 创建 AgentGraph 实例（不保存历史，历史存储在数据库中）
     agent_graph = AgentGraph(
-        skills=app_state["skills"],
+        skill_loader=app_state["skill_loader"],
+        metadata_list=app_state["metadata_list"],
         llm=app_state["llm"],
         max_history=SESSION_CONFIG["max_history"],
         session_id=session_id,
@@ -124,14 +125,12 @@ async def lifespan(app: FastAPI):
         logger.error("      ✗ 语言模型初始化失败：%s", e, exc_info=True)
         app_state["llm"] = None
     
-    # [3/4] 加载技能
-    logger.info("[3/4] 加载技能模块")
+    # [3/4] 加载技能元数据（轻量，不加载 tool.py）
+    logger.info("[3/4] 扫描技能目录")
     skill_loader = SkillLoader()
-    skills = skill_loader.load_all()
-    logger.info("      ✓ 已加载 %d 个技能:", len(skills))
-    for skill in skills:
-        logger.info("        - %s: %s", skill.name, skill.description)
-    app_state["skills"] = skills
+    metadata_list = skill_loader.load_all_metadata()
+    app_state["skill_loader"] = skill_loader
+    app_state["metadata_list"] = metadata_list
     
     # [4/4] 不再创建默认 AgentGraph（每次请求独立创建，避免并发竞态）
     logger.info("[4/4] 跳过默认代理图初始化（按请求创建）")
@@ -205,6 +204,7 @@ class ChatRequest(BaseModel):
     frequency_penalty: Optional[float] = Field(default=None, description="频率惩罚")
     presence_penalty: Optional[float] = Field(default=None, description="存在惩罚")
     enable_thinking: Optional[bool] = Field(default=None, description="是否启用思考模式")
+    selected_skills: Optional[List[str]] = Field(default=None, description="用户指定的技能名称列表，指定后跳过自动路由，直接使用指定技能")
 
 
 class ChatResponse(BaseModel):
@@ -224,7 +224,23 @@ class SessionResponse(BaseModel):
 
 # ==================== 辅助函数 ====================
 
-async def generate_stream_chunks_with_messages(messages: List[Dict[str, Any]], session_id: Optional[str] = None, custom_llm=None, enable_thinking: Optional[bool] = None) -> AsyncGenerator[str, None]:
+def _collect_llm_kwargs(request: ChatRequest) -> dict:
+    """从 ChatRequest 中收集非 None 的 OpenAI 兼容参数"""
+    kwargs = {}
+    for field in ("temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty"):
+        value = getattr(request, field, None)
+        if value is not None:
+            kwargs[field] = value
+    return kwargs
+
+
+async def generate_stream_chunks_with_messages(
+    messages: List[Dict[str, Any]],
+    session_id: Optional[str] = None,
+    custom_llm=None,
+    enable_thinking: Optional[bool] = None,
+    selected_skills: Optional[List[str]] = None
+) -> AsyncGenerator[str, None]:
     """
     生成流式数据块 - 支持 OpenAI 标准 messages 格式
     
@@ -233,6 +249,7 @@ async def generate_stream_chunks_with_messages(messages: List[Dict[str, Any]], s
         session_id: 会话 ID
         custom_llm: 自定义 LLM 实例
         enable_thinking: 是否启用思考模式
+        selected_skills: 用户指定的技能名称列表（可选）
         
     Yields:
         JSON 字符串格式的流式数据块
@@ -292,7 +309,8 @@ async def generate_stream_chunks_with_messages(messages: List[Dict[str, Any]], s
         async for chunk in agent_graph.run_stream_with_messages(
             processed_messages,
             enable_thinking=enable_thinking,
-            storage_messages=storage_messages
+            storage_messages=storage_messages,
+            selected_skills=selected_skills
         ):
             # 确保所有 yield 的都是 JSON 字符串
             if isinstance(chunk, dict):
@@ -355,7 +373,7 @@ async def health_check():
     return {
         "status": "healthy" if app_state["initialized"] else "initializing",
         "llm": "ready" if app_state["llm"] else "not ready",
-        "skills_count": len(app_state["skills"]) if app_state["skills"] else 0
+        "skills_count": len(app_state["metadata_list"]) if app_state["metadata_list"] else 0
     }
 
 
@@ -473,17 +491,7 @@ async def chat(request: ChatRequest):
                 break
         
         # 收集 OpenAI 兼容参数
-        llm_kwargs = {}
-        if request.temperature is not None:
-            llm_kwargs["temperature"] = request.temperature
-        if request.max_tokens is not None:
-            llm_kwargs["max_tokens"] = request.max_tokens
-        if request.top_p is not None:
-            llm_kwargs["top_p"] = request.top_p
-        if request.frequency_penalty is not None:
-            llm_kwargs["frequency_penalty"] = request.frequency_penalty
-        if request.presence_penalty is not None:
-            llm_kwargs["presence_penalty"] = request.presence_penalty
+        llm_kwargs = _collect_llm_kwargs(request)
         
         # 处理消息中的图片 URL，将内网图片转换为 base64
         processed_messages = request.messages
@@ -524,7 +532,8 @@ async def chat(request: ChatRequest):
                 result = await agent_graph.run_with_messages(
                     processed_messages,
                     enable_thinking=request.enable_thinking,
-                    storage_messages=storage_messages
+                    storage_messages=storage_messages,
+                    selected_skills=request.selected_skills
                 )
             finally:
                 agent_graph.llm = original_llm
@@ -534,7 +543,8 @@ async def chat(request: ChatRequest):
             result = await agent_graph.run_with_messages(
                 processed_messages,
                 enable_thinking=request.enable_thinking,
-                storage_messages=storage_messages
+                storage_messages=storage_messages,
+                selected_skills=request.selected_skills
             )
         
         formatted_result = format_response(result)
@@ -582,17 +592,7 @@ async def chat_stream(request: ChatRequest):
         raise HTTPException(status_code=503, detail="系统正在初始化中")
     
     # 收集 OpenAI 兼容参数
-    llm_kwargs = {}
-    if request.temperature is not None:
-        llm_kwargs["temperature"] = request.temperature
-    if request.max_tokens is not None:
-        llm_kwargs["max_tokens"] = request.max_tokens
-    if request.top_p is not None:
-        llm_kwargs["top_p"] = request.top_p
-    if request.frequency_penalty is not None:
-        llm_kwargs["frequency_penalty"] = request.frequency_penalty
-    if request.presence_penalty is not None:
-        llm_kwargs["presence_penalty"] = request.presence_penalty
+    llm_kwargs = _collect_llm_kwargs(request)
     
     # 如果指定了模型或其他参数，创建独立的 LLM 实例
     custom_llm = None
@@ -608,7 +608,8 @@ async def chat_stream(request: ChatRequest):
             request.messages,
             session_id=request.session_id,
             custom_llm=custom_llm,
-            enable_thinking=request.enable_thinking
+            enable_thinking=request.enable_thinking,
+            selected_skills=request.selected_skills
         ),
         media_type="text/event-stream",
         headers={
@@ -621,18 +622,19 @@ async def chat_stream(request: ChatRequest):
 
 @app.get("/api/skills")
 async def list_skills():
-    """获取可用技能列表"""
+    """获取可用技能列表（元数据）"""
     if not app_state["initialized"]:
         raise HTTPException(status_code=503, detail="系统正在初始化中")
-    
-    skills = app_state["skills"]
+
+    metadata_list = app_state["metadata_list"]
     return {
         "skills": [
             {
-                "name": skill.name,
-                "description": skill.description
+                "name": meta.name,
+                "description": meta.description,
+                "keywords": meta.keywords,
             }
-            for skill in skills
+            for meta in metadata_list
         ]
     }
 

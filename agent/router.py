@@ -3,32 +3,32 @@ Router - 路由器
 负责根据当前任务选择合适的技能或工具
 
 重构说明：
-  - 使用 routing_config 中的关键词配置，消除硬编码
-  - 使用 core.logger 替代 print
-  - 支持 BaseSkill 的 match_keywords() 接口
+  - 全部走 LLM 路由，不再使用关键词匹配
+  - 使用 SkillMetadata 轻量元数据进行路由决策
+  - 技能按需加载，路由阶段不加载 tool.py
 """
 
-from typing import Optional, Any, List
+from typing import Optional, List
 from .state import AgentState, Task
-from .routing_config import SKILL_KEYWORDS, get_skill_keywords
+from core.skill_loader import SkillMetadata
 from core.logger import get_logger
 
 logger = get_logger("agent.router")
 
 
 class Router:
-    """路由器类（简化版）"""
+    """路由器类 — LLM 路由"""
 
-    def __init__(self, llm=None, skills=None):
+    def __init__(self, llm=None, metadata_list: List[SkillMetadata] = None):
         """
-        初始化路由器（简化版）
+        初始化路由器
 
         Args:
             llm: 语言模型实例
-            skills: 可用技能列表
+            metadata_list: 技能元数据列表（轻量，不含 tool.py）
         """
         self.llm = llm
-        self.skills = skills or []
+        self.metadata_list = metadata_list or []
         self.prompt_template = self._load_prompt()
 
     def _load_prompt(self) -> str:
@@ -38,18 +38,22 @@ class Router:
                 return f.read()
         except FileNotFoundError:
             return """你是一个任务路由助手。
-请根据当前任务，选择合适的技能或工具来处理。
+根据用户任务，从可用技能中选择最合适的技能。
 
 可用技能：
 {skills}
 
-当前任务：{task}
+用户任务：{task}
 
-请输出应该使用的技能名称，如果没有合适的技能，输出"general"。"""
+请只输出技能名称。如果没有合适的技能，输出 None。"""
+
+    def update_metadata(self, metadata_list: List[SkillMetadata]):
+        """更新技能元数据列表"""
+        self.metadata_list = metadata_list
 
     async def route(self, state: AgentState) -> AgentState:
         """
-        路由到合适的技能（简化版）
+        路由到合适的技能（LLM 路由）
 
         Args:
             state: 当前代理状态
@@ -69,146 +73,94 @@ class Router:
 
         current_task = pending_tasks[0]
         state.current_task = current_task
-
-        # 更新任务状态
         current_task.status = "in_progress"
 
-        # 选择合适的技能（简化版：优先使用关键词匹配）
-        selected_skill = self._simple_match(current_task.description)
+        # ── 用户指定技能：跳过 LLM 路由 ──
+        user_selected_skills = state.context.get("selected_skills")
+        if user_selected_skills:
+            selected = self._match_user_skills(user_selected_skills)
+            if selected:
+                logger.info("使用用户指定的技能：%s（候选：%s）", selected, user_selected_skills)
+                state.context["selected_skill"] = selected
+                state.current_tool = selected
+                state.add_message("assistant", f"使用用户指定的技能：{selected}")
+                return state
+            else:
+                logger.warning("用户指定的技能均无效：%s，回退到 LLM 路由", user_selected_skills)
 
-        # 将选中的技能信息存入上下文和 current_tool
+        # ── LLM 路由 ──
+        selected_skill = await self._route_with_llm(current_task.description)
+
         state.context["selected_skill"] = selected_skill
         state.current_tool = selected_skill
         if selected_skill:
-            state.add_message("assistant", f"选择技能：{selected_skill or '无'}")
+            state.add_message("assistant", f"选择技能：{selected_skill}")
+        else:
+            logger.info("无匹配技能，将由 graph 直接流式回答")
 
         return state
 
-    # ── 关键词匹配（使用 routing_config） ──────────────
+    # ── 用户指定技能匹配 ──────────────────────────────
 
-    def _get_keywords_for_skill(self, skill_name: str) -> List[str]:
-        """
-        获取技能的关键词列表。优先使用 BaseSkill.match_keywords()，
-        回退到 routing_config.SKILL_KEYWORDS。
-        """
-        # 1. 优先使用技能自身的 match_keywords()
-        for skill in self.skills:
-            if skill.name == skill_name and hasattr(skill, "match_keywords"):
-                keywords = skill.match_keywords()
-                if keywords:
-                    return keywords
-
-        # 2. 回退到 routing_config
-        return get_skill_keywords(skill_name)
-
-    # 问候语列表 — 这些输入应直接走通用 LLM，不触发技能路由
-    GREETING_KEYWORDS = ["你好", "hello", "hi", "嗨", "您好", "hey", "早上好", "下午好", "晚上好"]
-
-    def _simple_match(self, task_description: str) -> Optional[str]:
-        """
-        简单匹配技能 — 基于关键词匹配（主要方式）。
-        关键词来源：routing_config.SKILL_KEYWORDS + BaseSkill.match_keywords()
-        """
-        task_lower = task_description.lower().strip()
-
-        # ── 0. 问候语检测 — 直接跳过路由，走通用 LLM ──
-        if task_lower in self.GREETING_KEYWORDS or len(task_lower) <= 4 and any(
-            g in task_lower for g in self.GREETING_KEYWORDS
-        ):
-            logger.debug(f"检测到问候语，跳过技能路由：{task_description}")
-            return None
-
-        # ── 1. 直接匹配技能名称 ──
-        for skill in self.skills:
-            if skill.name.lower() in task_lower:
-                return skill.name
-
-        # ── 2. 基于配置化关键词匹配 ──
-
-        # 收集所有技能的关键词（合并 routing_config 和 BaseSkill）
-        skill_keyword_map: dict[str, List[str]] = {}
-        all_skill_names: set = set(SKILL_KEYWORDS.keys())
-        for skill in self.skills:
-            all_skill_names.add(skill.name)
-
-        for name in all_skill_names:
-            skill_keyword_map[name] = self._get_keywords_for_skill(name)
-
-        # 检查每个技能的关键词命中情况
-        matched_scores: dict[str, int] = {}
-        for name, keywords in skill_keyword_map.items():
-            if not keywords:
-                continue
-            score = sum(1 for kw in keywords if kw in task_lower)
-            if score > 0:
-                matched_scores[name] = score
-
-        # ── 3. 特殊优先级规则 ──
-
-        # 区域/地图相关技能优先于单城市天气
-        map_skills = [
-            name for name in matched_scores
-            if "map" in name.lower() or "地图" in name.lower()
-        ]
-        weather_skills = [
-            name for name in matched_scores
-            if "weather" in name.lower() and "map" not in name.lower()
-        ]
-        time_skills = [
-            name for name in matched_scores
-            if "time" in name.lower() or "时间" in name.lower()
-        ]
-
-        # 如果同时命中地图和天气关键词，优先返回地图技能
-        if map_skills:
-            return max(map_skills, key=lambda n: matched_scores[n])
-
-        if weather_skills:
-            return max(weather_skills, key=lambda n: matched_scores[n])
-
-        if time_skills:
-            return max(time_skills, key=lambda n: matched_scores[n])
-
-        # ── 4. 通用回退：返回得分最高的技能 ──
-        if matched_scores:
-            return max(matched_scores, key=lambda n: matched_scores[n])
-
+    def _match_user_skills(self, user_selected_skills: List[str]) -> Optional[str]:
+        """从用户指定的技能列表中选择第一个有效的技能"""
+        available_names = {meta.name for meta in self.metadata_list}
+        for skill_name in user_selected_skills:
+            if skill_name in available_names:
+                return skill_name
         return None
 
-    # ── LLM 备用方案 ────────────────────────────────────
+    # ── LLM 路由 ──────────────────────────────────────
 
-    async def _select_skill_with_llm(self, task_description: str) -> Optional[str]:
-        """使用 LLM （备用方案）"""
-        if not self.skills:
+    async def _route_with_llm(self, task_description: str) -> Optional[str]:
+        """使用 LLM 选择合适的技能"""
+        if not self.metadata_list:
             return None
 
-        skills_info = "\n".join([f"- {s.name}: {s.description}" for s in self.skills])
+        if not self.llm:
+            logger.warning("LLM 未初始化，无法进行路由")
+            return None
+
+        # 构建技能描述列表
+        skills_info = "\n".join(
+            [f"- {m.name}: {m.description}" for m in self.metadata_list]
+        )
+
         prompt = self.prompt_template.format(
             skills=skills_info,
-            task=task_description
+            task=task_description,
         )
 
         try:
-            response = await self.llm.generate(prompt)
-            return self._parse_skill_selection(response)
+            from llm.llm import Message
+            response = await self.llm.chat([Message(role="user", content=prompt)])
+            selected = self._parse_skill_selection(response.content.strip())
+            if selected:
+                logger.info("LLM 路由结果：%s", selected)
+            else:
+                logger.info("LLM 路由结果：None（无匹配技能）")
+            return selected
         except Exception as e:
-            logger.error(f"LLM 技能选择失败：{e}")
+            logger.error("LLM 路由失败：%s", e, exc_info=True)
             return None
 
     def _parse_skill_selection(self, response: str) -> Optional[str]:
-        """解析技能选择结果（简化版）"""
-        response = response.strip()
+        """解析 LLM 路由结果"""
+        response = response.strip().strip('"').strip("'")
 
-        for skill in self.skills:
-            if skill.name in response:
-                return skill.name
+        # 检查是否匹配已知技能名
+        for meta in self.metadata_list:
+            if meta.name == response:
+                return meta.name
+
+        # 尝试从响应中提取技能名
+        response_lower = response.lower()
+        for meta in self.metadata_list:
+            if meta.name.lower() in response_lower:
+                return meta.name
+
+        # LLM 返回 None / none / 无
+        if response_lower in ("none", "null", "无", "无匹配", ""):
+            return None
 
         return None
-
-    def add_skill(self, skill: Any):
-        """添加技能"""
-        self.skills.append(skill)
-
-    def remove_skill(self, skill_name: str):
-        """移除技能"""
-        self.skills = [s for s in self.skills if s.name != skill_name]

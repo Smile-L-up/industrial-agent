@@ -86,6 +86,7 @@ class ExecutionContext:
     # 路由相关
     selected_skill: Optional[str] = None
     selected_subtool: Optional[str] = None
+    selected_skills: Optional[List[str]] = None  # 用户指定的候选技能列表
 
     # 思考模式
     thinking_content: Optional[str] = None
@@ -129,7 +130,7 @@ class ExecutionContext:
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
-        for fld_name in ("selected_skill", "selected_subtool",
+        for fld_name in ("selected_skill", "selected_subtool", "selected_skills",
                          "thinking_content", "usage"):
             val = getattr(self, fld_name)
             if val is not None:

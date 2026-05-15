@@ -1,25 +1,95 @@
-# Python
+# ==================== Python ====================
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
 
-# Env
+# ==================== 环境变量与密钥 ====================
 .env
+.env.*
+*.env
+.env.local
+.env.production
+.env.staging
 
-# IDE
+# 密钥与证书文件
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# SSH 相关
+id_rsa*
+*.ppk
+
+# 其他敏感文件
+credentials.json
+service_account.json
+*.credentials
+secrets.yaml
+secrets.yml
+secrets.json
+
+# ==================== IDE ====================
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
 
-# Database
+# ==================== 数据库 ====================
 data/
 *.db
+*.sqlite
+*.sqlite3
 
-# Models
+# ==================== 模型与大文件 ====================
 *.bin
 *.pt
 *.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.pkl
+*.pickle
 
-# Docker
+# 大型媒体文件
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
 *.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.iso
+*.dmg
 
-# Large files
-zft@192.168.110.201
+# 大型数据文件
+*.csv
+*.parquet
+*.feather
+*.h5
+
+# ==================== 日志 ====================
+*.log
+logs/
+
+# ==================== Claude Code ====================
+.claude/
+
+# ==================== 操作系统 ====================
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -3,35 +3,60 @@ Executor - 执行器
 负责执行选定的技能或工具
 
 重构说明：
-  - 使用 core.logger 替代 print
-  - 使用 routing_config.get_city_from_input() 替代硬编码城市列表
-  - 使用 BaseSkill.call_tool() 替代 hasattr 检查
-  - 清理调试残留
+  - 使用 SkillLoader 按需加载技能，不再持有完整技能列表
+  - 移除 routing_config 依赖，城市提取保留在本地
 """
 
-import asyncio
 import inspect
 from typing import Any, Dict, Optional, AsyncGenerator, List
-from .state import AgentState, Task
-from .routing_config import get_city_from_input
+from .state import AgentState
+from core.skill_loader import SkillLoader
 from core.logger import get_logger
 
 logger = get_logger("agent.executor")
 
 
-class Executor:
-    """执行器类"""
+def _get_city_from_input(text: str) -> Optional[str]:
+    """从用户输入中提取常见城市名称"""
+    city_map = {
+        "北京": "北京", "上海": "上海", "广州": "广州", "深圳": "深圳",
+        "杭州": "杭州", "成都": "成都", "武汉": "武汉", "南京": "南京",
+        "西安": "西安", "重庆": "重庆", "天津": "天津", "苏州": "苏州",
+        "长沙": "长沙", "郑州": "郑州", "厦门": "厦门",
+    }
+    for alias, city in city_map.items():
+        if alias in text:
+            return city
+    return None
 
-    def __init__(self, llm=None, skills=None):
+
+class Executor:
+    """执行器类 — 按需加载技能"""
+
+    def __init__(self, llm=None, skill_loader: SkillLoader = None):
         """
         初始化执行器
 
         Args:
             llm: 语言模型实例
-            skills: 可用技能列表
+            skill_loader: 技能加载器（用于按需加载技能）
         """
         self.llm = llm
-        self.skills = skills or []
+        self.skill_loader = skill_loader
+
+    def _find_skill(self, name: str) -> Optional[Any]:
+        """
+        查找技能 — 优先从缓存获取，未命中则按需加载。
+
+        Args:
+            name: 技能名称
+
+        Returns:
+            BaseSkill 实例，未找到返回 None
+        """
+        if not self.skill_loader:
+            return None
+        return self.skill_loader.load_skill_full(name)
 
     async def execute(self, state: AgentState, enable_thinking: Optional[bool] = None) -> AgentState:
         """
@@ -48,7 +73,6 @@ class Executor:
             state.set_error("没有当前任务")
             return state
 
-        # 获取选中的技能
         selected_skill_name = state.context.get("selected_skill")
 
         # 记录工具调用
@@ -99,27 +123,25 @@ class Executor:
 
         # 添加响应消息
         if result:
+            if not isinstance(result, str):
+                result = str(result)
             state.add_message("assistant", result)
 
         return state
-
-    # ── 技能查找 ──────────────────────────────────────
-
-    def _find_skill(self, name: str) -> Optional[Any]:
-        """查找技能"""
-        for skill in self.skills:
-            if skill.name == name:
-                return skill
-        return None
 
     # ── 技能执行 ──────────────────────────────────────
 
     async def _execute_skill(self, skill: Any, state: AgentState) -> str:
         """
         执行特定技能。
-        优先使用 BaseSkill 接口，回退到 hasattr 检查以兼容旧技能。
+        优先使用 BaseSkill 子工具接口，回退到 execute。
+        对配置模式技能（有 inputs 但无子工具），先用 LLM 提取结构化参数。
         """
         try:
+            # 注入 LLM 到 context，供 HttpSkill 等配置模式技能使用
+            if self.llm:
+                state.context["_llm"] = self.llm
+
             # ── 1. 尝试使用 BaseSkill 子工具接口 ──
             tools: List[Dict] = []
             if hasattr(skill, "get_tools") and callable(skill.get_tools):
@@ -133,7 +155,17 @@ class Executor:
                     result = await self._call_tool_method(skill, selected_tool, state)
                     return result
 
-            # ── 2. 调用技能的 execute 方法（通用回退） ──
+            # ── 2. 配置模式技能：用 LLM 提取结构化参数 ──
+            skill_inputs = getattr(skill, "_inputs", None)
+            if skill_inputs and self.llm:
+                extracted = await self._extract_http_params(
+                    state.current_task.description, skill_inputs
+                )
+                logger.info("配置模式技能参数提取结果：%s", extracted)
+                if extracted:
+                    state.context["extracted_args"] = extracted
+
+            # ── 3. 调用技能的 execute 方法 ──
             result = await skill.execute(
                 task=state.current_task.description,
                 context=state.context,
@@ -142,7 +174,7 @@ class Executor:
             return result
 
         except Exception as e:
-            logger.error(f"技能执行失败：{e}", exc_info=True)
+            logger.error("技能执行失败：%s", e, exc_info=True)
             state.set_error(f"技能执行失败：{str(e)}")
             return f"执行失败：{str(e)}"
 
@@ -178,7 +210,7 @@ class Executor:
                         return selected_tool
             return self._simple_tool_match(task, tools)
         except Exception as e:
-            logger.error(f"LLM 工具选择失败：{e}")
+            logger.error("LLM 工具选择失败：%s", e)
             return self._simple_tool_match(task, tools)
 
     def _simple_tool_match(self, task: str, tools: List[Dict]) -> Optional[str]:
@@ -202,6 +234,59 @@ class Executor:
         # 默认返回第一个工具
         return tools[0]["name"] if tools else None
 
+    # ── 配置模式技能：LLM 参数提取 ──────────────────────
+
+    async def _extract_http_params(
+        self, task: str, skill_inputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        使用 LLM 从用户消息中提取结构化参数（JSON）。
+        用于配置模式技能（如 HttpSkill），让 LLM 直接生成工具调用参数。
+        """
+        import json
+        import re
+
+        param_lines = []
+        for name, cfg in skill_inputs.items():
+            desc = cfg.get("description", cfg.get("type", "string"))
+            default = cfg.get("default", "")
+            if default:
+                param_lines.append(f'  "{name}": "{desc}"（默认值：{default}）')
+            else:
+                param_lines.append(f'  "{name}": "{desc}"')
+        params_desc = "\n".join(param_lines)
+
+        prompt = f"""请从用户消息中提取以下参数，返回 JSON 对象。
+只返回 JSON，不要其他文字。未提及的参数不要包含。
+对于日期类参数如"昨天"，请转换为 YYYY-MM-DD 格式。
+
+参数说明：
+{params_desc}
+
+用户消息：{task}
+
+JSON："""
+
+        logger.info("LLM 参数提取，用户消息：%s", task)
+        logger.debug("参数提取 prompt：%s", prompt)
+
+        try:
+            from llm.llm import Message
+            response = await self.llm.chat([Message(role="user", content=prompt)])
+            text = response.content.strip()
+            logger.info("LLM 参数提取原始返回：%s", text[:200])
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            result = json.loads(text)
+            logger.info("LLM 参数提取成功：%s", result)
+            return result
+        except json.JSONDecodeError as e:
+            logger.warning("LLM 参数提取 JSON 解析失败：%s，原始返回：%s", e, text[:200])
+            return {}
+        except Exception as e:
+            logger.warning("LLM 参数提取失败：%s", e, exc_info=True)
+            return {}
+
     # ── 子工具调用 ────────────────────────────────────
 
     async def _call_tool_method(self, skill: Any, tool_name: str, state: AgentState) -> str:
@@ -209,39 +294,35 @@ class Executor:
         try:
             state.context["current_subtool"] = tool_name
 
-            # 从任务中提取城市（使用配置化的 city 提取）
-            city = get_city_from_input(state.current_task.description)
-
-            if not city:
-                # 没有城市参数，回退到 execute
-                return await skill.execute(
-                    task=state.current_task.description,
-                    context=state.context,
-                    messages=state.messages,
-                )
-
-            # ── 优先使用 BaseSkill.call_tool() 接口 ──
+            # 优先使用 BaseSkill.call_tool() 接口
             from core.base_skill import BaseSkill
             if isinstance(skill, BaseSkill):
                 try:
+                    # 尝试从任务中提取参数
+                    arguments = {}
+                    city = _get_city_from_input(state.current_task.description)
+                    if city:
+                        arguments["city"] = city
+
                     result = await skill.call_tool(
                         tool_name=tool_name,
-                        arguments={"city": city},
+                        arguments=arguments,
                         context=state.context.to_dict(),
                     )
                     return self._format_tool_result(tool_name, result)
                 except AttributeError:
-                    logger.warning(f"BaseSkill.call_tool 未找到子工具 {tool_name}，回退到 execute")
+                    logger.warning("BaseSkill.call_tool 未找到子工具 %s，回退到 execute", tool_name)
 
-            # ── 回退：兼容旧技能的 hasattr 检查 ──
+            # 回退：兼容旧技能
             if hasattr(skill, tool_name):
                 method = getattr(skill, tool_name)
                 if callable(method):
                     sig = inspect.signature(method)
                     params = list(sig.parameters.keys())
 
-                    if "city" in params:
-                        if asyncio.iscoroutinefunction(method):
+                    city = _get_city_from_input(state.current_task.description)
+                    if city and "city" in params:
+                        if inspect.iscoroutinefunction(method):
                             result = await method(city)
                         else:
                             result = method(city)
@@ -254,7 +335,7 @@ class Executor:
                 messages=state.messages,
             )
         except Exception as e:
-            logger.error(f"子工具调用失败：{e}", exc_info=True)
+            logger.error("子工具调用失败：%s", e, exc_info=True)
             return await skill.execute(
                 task=state.current_task.description,
                 context=state.context,
@@ -283,7 +364,6 @@ class Executor:
     ) -> Any:
         """调用工具方法获取原始数据结果"""
         try:
-            # 优先使用 BaseSkill.call_tool()
             from core.base_skill import BaseSkill
             if isinstance(skill, BaseSkill):
                 args: Dict[str, Any] = {}
@@ -295,16 +375,15 @@ class Executor:
                     context={},
                 )
 
-            # 回退：兼容旧技能
             if hasattr(skill, tool_name):
                 method = getattr(skill, tool_name)
                 if callable(method):
-                    if asyncio.iscoroutinefunction(method):
+                    if inspect.iscoroutinefunction(method):
                         return await method(city) if city else await method()
                     else:
                         return method(city) if city else method()
         except Exception as e:
-            logger.error(f"工具执行失败：{e}")
+            logger.error("工具执行失败：%s", e)
         return None
 
     # ── LLM 生成回复 ──────────────────────────────────
@@ -339,7 +418,7 @@ class Executor:
             )
             return response.content
         except Exception as e:
-            logger.error(f"LLM 生成回复失败：{e}")
+            logger.error("LLM 生成回复失败：%s", e)
             return self._format_tool_result(tool_name, tool_result)
 
     async def _generate_response_with_tool_result_stream(
@@ -382,7 +461,7 @@ class Executor:
                 else:
                     yield {"type": "token", "content": chunk}
         except Exception as e:
-            logger.error(f"LLM 流式生成回复失败：{e}")
+            logger.error("LLM 流式生成回复失败：%s", e)
             yield {"type": "token", "content": self._format_tool_result(tool_name, tool_result)}
 
     # ── 数据格式化辅助 ────────────────────────────────
@@ -417,23 +496,17 @@ class Executor:
         if self.llm is None:
             return "无法处理该请求，请配置语言模型。"
 
-        from llm.llm import Message
+        messages = self._build_messages(state)
 
-        messages = [
-            Message(role=msg.get("role", "user"), content=msg.get("content", ""))
-            for msg in state.messages
-        ]
-
-        logger.debug(f"调用 _execute_general, enable_thinking={enable_thinking}")
+        logger.debug("调用 _execute_general, enable_thinking=%s", enable_thinking)
 
         response = await self.llm.chat(messages, enable_thinking=enable_thinking)
 
         logger.debug(
-            f"LLM 返回, thinking_content="
-            f"{response.thinking_content[:50] if response.thinking_content else None}..."
+            "LLM 返回, thinking_content=%s...",
+            response.thinking_content[:50] if response.thinking_content else None,
         )
 
-        # 保存思考内容到 state
         if response.thinking_content:
             state.context["thinking_content"] = response.thinking_content
 
@@ -448,12 +521,7 @@ class Executor:
         流式执行当前任务 — 支持思考模式
 
         Yields:
-            流式事件数据：
-            - {"type": "reasoning_content", "content": "..."}
-            - {"type": "token", "content": "..."}
-            - {"type": "error", "content": "..."}
-            - {"type": "tool_call", "name": "...", "args": {...}}
-            - {"type": "tool_result", "name": "...", "result": {...}}
+            流式事件数据
         """
         if not state.current_task:
             state.set_error("没有当前任务")
@@ -486,7 +554,7 @@ class Executor:
                     )
                     if selected_tool:
                         state.context["current_subtool"] = selected_tool
-                        city = get_city_from_input(state.current_task.description)
+                        city = _get_city_from_input(state.current_task.description)
 
                         tool_result_data = await self._get_tool_result(
                             skill, selected_tool, city
@@ -527,6 +595,62 @@ class Executor:
                         state.add_message("assistant", full_response)
                         return
 
+                # ── 配置模式技能（如 HttpSkill）：LLM 提取参数 + 调用服务 ──
+                skill_inputs = getattr(skill, "_inputs", None)
+                if skill_inputs:
+                    if self.llm:
+                        state.context["_llm"] = self.llm
+
+                    # 用 LLM 从用户消息中提取结构化参数
+                    if self.llm:
+                        yield {"type": "status", "content": "正在提取参数......"}
+                        extracted = await self._extract_http_params(
+                            state.current_task.description, skill_inputs
+                        )
+                        if extracted:
+                            state.context["extracted_args"] = extracted
+                            logger.info("LLM 参数提取结果：%s", extracted)
+                        else:
+                            logger.warning("LLM 参数提取返回空")
+
+                    # 执行技能（HTTP 调用）
+                    yield {"type": "status", "content": f"正在调用 {selected_skill_name} 服务......"}
+                    try:
+                        result = await skill.execute(
+                            task=state.current_task.description,
+                            context=state.context,
+                            messages=state.messages,
+                        )
+                    except Exception as e:
+                        logger.error("配置模式技能执行失败：%s", e, exc_info=True)
+                        result = f"服务调用失败：{str(e)}"
+
+                    state.execution_record.add_tool_result(
+                        tool=selected_skill_name,
+                        result=result,
+                        success=True,
+                    )
+
+                    # 流式输出结果
+                    if self.llm:
+                        async for chunk in self._generate_response_with_tool_result_stream(
+                            state.current_task.description,
+                            selected_skill_name,
+                            result,
+                            enable_thinking,
+                        ):
+                            chunk_type = chunk.get("type")
+                            chunk_content = chunk.get("content", "")
+                            if chunk_type == "reasoning_content":
+                                if enable_thinking is not False:
+                                    yield {"type": "reasoning_content", "content": chunk_content}
+                            elif chunk_type == "token":
+                                yield {"type": "token", "content": chunk_content}
+                    else:
+                        yield {"type": "token", "content": str(result)}
+
+                    return
+
                 # ── 技能流式执行 ──
                 if hasattr(skill, "execute_stream"):
                     async for chunk in skill.execute_stream(
@@ -542,17 +666,12 @@ class Executor:
             yield {"type": "error", "content": "无法处理该请求，请配置语言模型。"}
             return
 
-        from llm.llm import Message
-
-        messages = [
-            Message(role=msg.get("role", "user"), content=msg.get("content", ""))
-            for msg in state.messages
-        ]
+        messages = self._build_messages(state)
 
         full_response = ""
         full_thinking = ""
 
-        logger.debug(f"调用 llm.chat_stream, enable_thinking={enable_thinking}")
+        logger.debug("调用 llm.chat_stream, enable_thinking=%s", enable_thinking)
 
         async for chunk in self.llm.chat_stream(messages, enable_thinking=enable_thinking):
             if isinstance(chunk, dict):
@@ -596,6 +715,14 @@ class Executor:
 
     # ── 辅助方法 ──────────────────────────────────────
 
+    def _build_messages(self, state: AgentState) -> list:
+        """从 state.messages 构建 LLM Message 列表"""
+        from llm.llm import Message
+        return [
+            Message(role=msg.get("role", "user"), content=msg.get("content", ""))
+            for msg in state.messages
+        ]
+
     def _build_general_prompt(self, state: AgentState) -> str:
         """构建通用提示词（备用方案）"""
         messages = state.messages
@@ -612,11 +739,3 @@ class Executor:
                 content = " ".join(text_parts) if text_parts else str(content)
             prompt_parts.append(f"{role}: {content}")
         return "\n".join(prompt_parts)
-
-    def add_skill(self, skill: Any):
-        """添加技能"""
-        self.skills.append(skill)
-
-    def remove_skill(self, skill_name: str):
-        """移除技能"""
-        self.skills = [s for s in self.skills if s.name != skill_name]

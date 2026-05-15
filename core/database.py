@@ -99,6 +99,9 @@ class DatabaseManager:
         # 确保 SQLite 目录存在
         if self.db_type == "sqlite":
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        # SQL 占位符：MySQL 用 %s，SQLite 用 ?
+        self._placeholder = "%s" if self.db_type == "mysql" else "?"
         
         # 连接池配置
         self._pool_lock = threading.Lock()
@@ -422,7 +425,7 @@ class DatabaseManager:
     def create_session(self, session_id: str, metadata: Optional[Dict] = None) -> bool:
         """创建新会话"""
         now = datetime.now().isoformat()
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 INSERT INTO sessions (id, created_at, updated_at, last_used_at, metadata)
@@ -432,7 +435,7 @@ class DatabaseManager:
     
     def get_session(self, session_id: str) -> Optional[Dict]:
         """获取会话信息"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"SELECT * FROM sessions WHERE id = {placeholder}", (session_id,))
             row = cursor.fetchone()
@@ -458,7 +461,7 @@ class DatabaseManager:
     def update_session_last_used(self, session_id: str) -> bool:
         """更新会话最后使用时间"""
         now = datetime.now().isoformat()
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 UPDATE sessions SET last_used_at = {placeholder}, updated_at = {placeholder} WHERE id = {placeholder}
@@ -467,7 +470,7 @@ class DatabaseManager:
     
     def delete_session(self, session_id: str) -> bool:
         """删除会话"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"DELETE FROM image_assets WHERE session_id = {placeholder}", (session_id,))
             cursor.execute(f"DELETE FROM conversation_history WHERE session_id = {placeholder}", (session_id,))
@@ -478,7 +481,7 @@ class DatabaseManager:
         """清理过期会话"""
         cutoff = (datetime.now() - timedelta(minutes=ttl_minutes)).isoformat()
         # MySQL 使用 %s 占位符，SQLite 使用 ? 占位符
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"SELECT id FROM sessions WHERE last_used_at < {placeholder}", (cutoff,))
             expired_ids = []
@@ -520,7 +523,7 @@ class DatabaseManager:
     ) -> int:
         """添加对话消息"""
         now = datetime.now().isoformat()
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         
         # 将 content 转换为 JSON 字符串（支持多模态消息，content 可能是列表）
         if isinstance(content, (list, dict)):
@@ -549,7 +552,7 @@ class DatabaseManager:
     
     def get_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """获取对话历史"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 SELECT role, content, created_at, message_index 
@@ -579,7 +582,7 @@ class DatabaseManager:
     
     def get_messages_count(self, session_id: str) -> int:
         """获取消息数量"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*) as count FROM conversation_history WHERE session_id = {placeholder}", (session_id,))
             row = cursor.fetchone()
@@ -589,14 +592,14 @@ class DatabaseManager:
     
     def clear_history(self, session_id: str) -> bool:
         """清空对话历史"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"DELETE FROM conversation_history WHERE session_id = {placeholder}", (session_id,))
         return True
     
     def trim_history(self, session_id: str, max_history: int) -> bool:
         """裁剪历史，只保留最新的 max_history 条"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 SELECT message_index FROM conversation_history 
@@ -633,7 +636,7 @@ class DatabaseManager:
         """保存图片资产并返回轻量引用 ID。"""
         now = datetime.now().isoformat()
         image_id = f"img_{sha256[:16]}_{session_id[:8]}"
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
 
         with self.get_cursor() as cursor:
             cursor.execute(f"SELECT id FROM image_assets WHERE id = {placeholder}", (image_id,))
@@ -672,7 +675,7 @@ class DatabaseManager:
 
     def get_image_asset(self, image_id: str) -> Optional[Dict[str, Any]]:
         """获取图片资产。"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 SELECT id, session_id, sha256, mime_type, data_base64, size_bytes,
@@ -726,7 +729,7 @@ class DatabaseManager:
     ) -> bool:
         """添加长期记忆"""
         now = datetime.now().isoformat()
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 INSERT INTO long_term_memories (id, content, type, importance, created_at, accessed_at, metadata, session_id)
@@ -741,7 +744,7 @@ class DatabaseManager:
         limit: int = 10
     ) -> List[Dict[str, Any]]:
         """获取记忆列表"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         conditions = []
         params = []
         
@@ -791,14 +794,14 @@ class DatabaseManager:
     
     def delete_memory(self, memory_id: str) -> bool:
         """删除记忆"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"DELETE FROM long_term_memories WHERE id = {placeholder}", (memory_id,))
         return True
     
     def clear_memories(self, session_id: Optional[str] = None) -> bool:
         """清空记忆"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             if session_id:
                 cursor.execute(f"DELETE FROM long_term_memories WHERE session_id = {placeholder}", (session_id,))
@@ -816,7 +819,7 @@ class DatabaseManager:
     ) -> bool:
         """添加动作记录"""
         now = datetime.now().isoformat()
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 INSERT INTO action_history (session_id, action_type, action_data, created_at)
@@ -826,7 +829,7 @@ class DatabaseManager:
     
     def get_actions(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """获取动作历史"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"""
                 SELECT action_type, action_data, created_at
@@ -854,7 +857,7 @@ class DatabaseManager:
     
     def clear_actions(self, session_id: str) -> bool:
         """清空动作历史"""
-        placeholder = "%s" if self.db_type == "mysql" else "?"
+        placeholder = self._placeholder
         with self.get_cursor() as cursor:
             cursor.execute(f"DELETE FROM action_history WHERE session_id = {placeholder}", (session_id,))
         return True

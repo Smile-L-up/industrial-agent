@@ -41,17 +41,15 @@ async def main(stream: bool = False, query: str = "你是谁？", interactive: b
         logger.error("      ✗ 语言模型初始化失败：%s", e, exc_info=True)
         llm = None
     
-    # 加载技能
-    logger.info("[2/3] 加载技能模块")
+    # 加载技能元数据（轻量，不加载 tool.py）
+    logger.info("[2/3] 扫描技能目录")
     skill_loader = SkillLoader()
-    skills = skill_loader.load_all()
-    logger.info("      ✓ 已加载 %d 个技能:", len(skills))
-    for skill in skills:
-        logger.info("        - %s: %s", skill.name, skill.description)
-    
+    metadata_list = skill_loader.load_all_metadata()
+    logger.info("      ✓ 已发现 %d 个技能", len(metadata_list))
+
     # 初始化代理图（简化版，不需要记忆系统）
     logger.info("[3/3] 初始化代理图")
-    agent_graph = AgentGraph(skills=skills, llm=llm)
+    agent_graph = AgentGraph(skill_loader=skill_loader, metadata_list=metadata_list, llm=llm)
     logger.info("      ✓ 代理图初始化成功")
     
     logger.info("=" * 50)
