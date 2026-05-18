@@ -8,6 +8,7 @@ Router - 路由器
   - 技能按需加载，路由阶段不加载 tool.py
 """
 
+import asyncio
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from .state import AgentState, Task
 from core.skill_loader import SkillMetadata
@@ -173,6 +174,7 @@ class Router:
         task_description: str,
         messages: list,
         enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         流式合并路由：一次 LLM 调用同时完成路由和回答。
@@ -184,6 +186,7 @@ class Router:
             task_description: 用户任务描述
             messages: 完整对话历史（用于直接回答时构建上下文）
             enable_thinking: 是否启用思考模式
+            cancel_event: 取消信号事件
         """
         if not self.llm:
             yield {"type": "token", "content": "抱歉，我暂时无法处理这个问题。"}
@@ -191,7 +194,7 @@ class Router:
 
         # ── 无技能 → 直接流式回答 ──
         if not self.metadata_list:
-            async for chunk in self._stream_answer(messages, enable_thinking):
+            async for chunk in self._stream_answer(messages, enable_thinking, cancel_event=cancel_event):
                 yield chunk
             return
 
@@ -212,8 +215,13 @@ class Router:
 
         try:
             async for chunk in self.llm.chat_stream(
-                llm_messages, enable_thinking=enable_thinking
+                llm_messages, cancel_event=cancel_event, enable_thinking=enable_thinking
             ):
+                # 检查取消信号
+                if cancel_event and cancel_event.is_set():
+                    logger.info("路由阶段检测到取消信号")
+                    return
+
                 if chunk.get("type") == "reasoning_content":
                     continue
 
@@ -256,6 +264,9 @@ class Router:
                         for ch in remaining:
                             yield {"type": "token", "content": ch}
 
+        except asyncio.CancelledError:
+            logger.info("路由阶段被取消")
+            return
         except Exception as e:
             logger.error("流式路由失败：%s", e, exc_info=True)
             yield {"type": "token", "content": "抱歉，处理请求时出现问题。"}
@@ -291,6 +302,7 @@ class Router:
         self,
         messages: list,
         enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """用 LLM 流式直接回答（无技能场景）"""
         from llm.llm import Message
@@ -300,7 +312,11 @@ class Router:
             for msg in messages
         ]
 
-        async for chunk in self.llm.chat_stream(llm_messages, enable_thinking=enable_thinking):
+        async for chunk in self.llm.chat_stream(llm_messages, cancel_event=cancel_event, enable_thinking=enable_thinking):
+            # 检查取消信号
+            if cancel_event and cancel_event.is_set():
+                logger.info("流式回答阶段检测到取消信号")
+                return
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
                 if chunk_type == "reasoning_content":

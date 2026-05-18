@@ -7,6 +7,7 @@ Agent Graph - 代理图状态机
   - 路由阶段只传元数据，执行阶段按需加载
 """
 
+import asyncio
 import logging
 import uuid
 from typing import Dict, Any, Optional, AsyncGenerator, List
@@ -238,10 +239,18 @@ class AgentGraph:
         messages: List[Dict[str, Any]],
         enable_thinking: Optional[bool] = None,
         storage_messages: Optional[List[Dict[str, Any]]] = None,
-        selected_skills: Optional[List[str]] = None
+        selected_skills: Optional[List[str]] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         运行代理流程（流式版本）- 使用 OpenAI 标准 messages 格式（支持多模态）
+
+        Args:
+            messages: 消息列表
+            enable_thinking: 是否启用思考模式
+            storage_messages: 存储用消息列表
+            selected_skills: 用户指定的技能列表
+            cancel_event: 取消信号事件
         """
         state, user_input, handler = await self._prepare_state(messages, selected_skills=selected_skills)
 
@@ -268,8 +277,15 @@ class AgentGraph:
         if not state.current_tool:
             full_response = ""
             async for chunk in self.router.route_stream(
-                user_input, state.messages, enable_thinking=enable_thinking
+                user_input, state.messages, enable_thinking=enable_thinking,
+                cancel_event=cancel_event
             ):
+                # 检查取消信号
+                if cancel_event and cancel_event.is_set():
+                    logger.info("Agent 流程检测到取消信号（路由阶段）")
+                    yield {"type": "cancelled", "content": "请求已被用户取消"}
+                    return
+
                 if chunk["type"] == "skill_match":
                     skill = chunk["skill"]
                     state.context["selected_skill"] = skill
@@ -299,7 +315,13 @@ class AgentGraph:
         full_response = ""
         full_thinking = ""
 
-        async for chunk in self.executor.execute_stream(state, enable_thinking=enable_thinking):
+        async for chunk in self.executor.execute_stream(state, enable_thinking=enable_thinking, cancel_event=cancel_event):
+            # 检查取消信号
+            if cancel_event and cancel_event.is_set():
+                logger.info("Agent 流程检测到取消信号（执行阶段）")
+                yield {"type": "cancelled", "content": "请求已被用户取消"}
+                return
+
             chunk_type = chunk.get("type")
             if chunk_type == "reasoning_content":
                 full_thinking += chunk["content"]
@@ -317,6 +339,9 @@ class AgentGraph:
                 })
             elif chunk_type == "error":
                 yield chunk
+            elif chunk_type == "cancelled":
+                yield chunk
+                return
 
         # 获取工具执行结果并显示最终状态
         tool_result = state.tool_results[-1] if state.tool_results else None

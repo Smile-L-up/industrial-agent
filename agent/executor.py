@@ -7,6 +7,7 @@ Executor - 执行器
   - 移除 routing_config 依赖，城市提取保留在本地
 """
 
+import asyncio
 import inspect
 from typing import Any, Dict, Optional, AsyncGenerator, List
 from .state import AgentState
@@ -427,6 +428,7 @@ JSON："""
         tool_name: str,
         tool_result: Any,
         enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """使用 LLM 根据工具执行结果生成自然语言回复（流式）"""
         if not self.llm:
@@ -448,8 +450,13 @@ JSON："""
         try:
             async for chunk in self.llm.chat_stream(
                 [Message(role="user", content=prompt)],
+                cancel_event=cancel_event,
                 enable_thinking=enable_thinking,
             ):
+                # 检查取消信号
+                if cancel_event and cancel_event.is_set():
+                    logger.info("工具结果生成阶段检测到取消信号")
+                    return
                 if isinstance(chunk, dict):
                     chunk_type = chunk.get("type")
                     chunk_content = chunk.get("content", "")
@@ -460,6 +467,9 @@ JSON："""
                         yield {"type": "token", "content": chunk_content}
                 else:
                     yield {"type": "token", "content": chunk}
+        except asyncio.CancelledError:
+            logger.info("工具结果生成阶段被取消")
+            return
         except Exception as e:
             logger.error("LLM 流式生成回复失败：%s", e)
             yield {"type": "token", "content": self._format_tool_result(tool_name, tool_result)}
@@ -515,10 +525,16 @@ JSON："""
     # ── 流式执行 ──────────────────────────────────────
 
     async def execute_stream(
-        self, state: AgentState, enable_thinking: Optional[bool] = None
+        self, state: AgentState, enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         流式执行当前任务 — 支持思考模式
+
+        Args:
+            state: 当前代理状态
+            enable_thinking: 是否启用思考模式
+            cancel_event: 取消信号事件
 
         Yields:
             流式事件数据
@@ -577,7 +593,13 @@ JSON："""
                             selected_tool,
                             tool_result_data,
                             enable_thinking,
+                            cancel_event=cancel_event,
                         ):
+                            # 检查取消信号
+                            if cancel_event and cancel_event.is_set():
+                                logger.info("子工具执行阶段检测到取消信号")
+                                return
+
                             chunk_type = chunk.get("type")
                             chunk_content = chunk.get("content", "")
 
@@ -638,7 +660,12 @@ JSON："""
                             selected_skill_name,
                             result,
                             enable_thinking,
+                            cancel_event=cancel_event,
                         ):
+                            # 检查取消信号
+                            if cancel_event and cancel_event.is_set():
+                                logger.info("配置模式技能执行阶段检测到取消信号")
+                                return
                             chunk_type = chunk.get("type")
                             chunk_content = chunk.get("content", "")
                             if chunk_type == "reasoning_content":
@@ -673,7 +700,12 @@ JSON："""
 
         logger.debug("调用 llm.chat_stream, enable_thinking=%s", enable_thinking)
 
-        async for chunk in self.llm.chat_stream(messages, enable_thinking=enable_thinking):
+        async for chunk in self.llm.chat_stream(messages, cancel_event=cancel_event, enable_thinking=enable_thinking):
+            # 检查取消信号
+            if cancel_event and cancel_event.is_set():
+                logger.info("通用执行阶段检测到取消信号")
+                return
+
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
                 chunk_content = chunk.get("content", "")

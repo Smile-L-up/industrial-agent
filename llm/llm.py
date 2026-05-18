@@ -274,21 +274,23 @@ class OpenAILLM(BaseLLM):
     async def chat_stream(
         self,
         messages: List[Message],
+        cancel_event: Optional[asyncio.Event] = None,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         流式对话 - 支持思考模式（实时输出）
-        
+
         Args:
             messages: 消息列表
+            cancel_event: 取消信号事件（设置后终止流式输出）
             **kwargs: 其他参数
-            
+
         Yields:
             字典格式的数据块，包含：
             - {"type": "reasoning_content", "content": "..."}  # 思考内容（实时输出）
             - {"type": "content", "content": "..."}  # 回答内容（实时输出）
             - {"type": "usage", "usage": {...}}  # usage 信息
-            
+
         示例:
             async for chunk in llm.chat_stream(messages, enable_thinking=True):
                 if chunk["type"] == "reasoning_content":
@@ -342,42 +344,53 @@ class OpenAILLM(BaseLLM):
             logger.debug("chat_stream model=%s, enable_thinking=%s", self.model, enable_thinking)
         
         stream = await self.client.chat.completions.create(**request_params)
-        
+
         # 实时输出：收到 chunk 后立即 yield，不再缓存
-        async for chunk in stream:
-            if not chunk.choices:
-                # 返回 usage 信息
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    yield {
-                        "type": "usage",
-                        "usage": {
-                            "prompt_tokens": chunk.usage.prompt_tokens,
-                            "completion_tokens": chunk.usage.completion_tokens,
-                            "total_tokens": chunk.usage.total_tokens
+        try:
+            async for chunk in stream:
+                # 检查取消信号
+                if cancel_event and cancel_event.is_set():
+                    logger.info("检测到取消信号，终止 LLM 流式输出")
+                    await stream.close()
+                    return
+
+                if not chunk.choices:
+                    # 返回 usage 信息
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        yield {
+                            "type": "usage",
+                            "usage": {
+                                "prompt_tokens": chunk.usage.prompt_tokens,
+                                "completion_tokens": chunk.usage.completion_tokens,
+                                "total_tokens": chunk.usage.total_tokens
+                            }
                         }
-                    }
-                continue
-            
-            delta = chunk.choices[0].delta
-            
-            # 实时输出思考内容
-            if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
-                logger.debug("chat_stream 收到 reasoning_content, enable_thinking=%s, content=%s...", enable_thinking, delta.reasoning_content[:30])
-                # 如果 enable_thinking=False，跳过输出思考内容
-                if enable_thinking is not False:
+                    continue
+
+                delta = chunk.choices[0].delta
+
+                # 实时输出思考内容
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+                    logger.debug("chat_stream 收到 reasoning_content, enable_thinking=%s, content=%s...", enable_thinking, delta.reasoning_content[:30])
+                    # 如果 enable_thinking=False，跳过输出思考内容
+                    if enable_thinking is not False:
+                        yield {
+                            "type": "reasoning_content",
+                            "content": delta.reasoning_content
+                        }
+                    else:
+                        logger.debug("chat_stream enable_thinking=False, 跳过输出思考内容")
+
+                # 实时输出回答内容
+                if hasattr(delta, "content") and delta.content is not None:
                     yield {
-                        "type": "reasoning_content",
-                        "content": delta.reasoning_content
+                        "type": "content",
+                        "content": delta.content
                     }
-                else:
-                    logger.debug("chat_stream enable_thinking=False, 跳过输出思考内容")
-            
-            # 实时输出回答内容
-            if hasattr(delta, "content") and delta.content is not None:
-                yield {
-                    "type": "content",
-                    "content": delta.content
-                }
+        except asyncio.CancelledError:
+            logger.info("LLM 流式输出被取消")
+            await stream.close()
+            raise
 
 
 class AzureOpenAILLM(BaseLLM):

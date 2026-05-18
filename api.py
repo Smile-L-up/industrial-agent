@@ -46,6 +46,39 @@ app_state = {
 }
 
 
+class CancelRegistry:
+    """取消信号注册表 — 管理活跃请求的取消事件"""
+
+    def __init__(self):
+        self._events: Dict[str, asyncio.Event] = {}
+
+    def register(self, request_id: str) -> asyncio.Event:
+        """注册一个请求，返回其取消事件"""
+        event = asyncio.Event()
+        self._events[request_id] = event
+        return event
+
+    def cancel(self, request_id: str) -> bool:
+        """取消指定请求，返回是否成功"""
+        event = self._events.get(request_id)
+        if event:
+            event.set()
+            return True
+        return False
+
+    def unregister(self, request_id: str):
+        """移除请求的取消事件"""
+        self._events.pop(request_id, None)
+
+    def is_cancelled(self, request_id: str) -> bool:
+        """检查请求是否已被取消"""
+        event = self._events.get(request_id)
+        return event.is_set() if event else False
+
+
+cancel_registry = CancelRegistry()
+
+
 def cleanup_expired_sessions():
     """清理过期会话（数据库方式）"""
     db = get_database()
@@ -197,6 +230,7 @@ class ChatRequest(BaseModel):
     """
     messages: List[Dict[str, Any]] = Field(..., description="OpenAI 标准格式的消息列表，支持多模态内容")
     session_id: Optional[str] = Field(default=None, description="会话 ID，用于多轮对话。首次可不传，后续请求携带返回的 session_id")
+    request_id: Optional[str] = Field(default=None, description="请求 ID，用于取消请求。客户端生成唯一 ID，调用 /api/chat/cancel 可取消该请求")
     model: Optional[str] = Field(default=None, description="指定使用的模型（可选，用于覆盖默认配置）")
     temperature: Optional[float] = Field(default=None, description="温度参数（0-2，越高越随机）")
     max_tokens: Optional[int] = Field(default=None, description="最大生成 token 数")
@@ -239,18 +273,22 @@ async def generate_stream_chunks_with_messages(
     session_id: Optional[str] = None,
     custom_llm=None,
     enable_thinking: Optional[bool] = None,
-    selected_skills: Optional[List[str]] = None
+    selected_skills: Optional[List[str]] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    request_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """
     生成流式数据块 - 支持 OpenAI 标准 messages 格式
-    
+
     Args:
         messages: OpenAI 标准格式的消息列表
         session_id: 会话 ID
         custom_llm: 自定义 LLM 实例
         enable_thinking: 是否启用思考模式
         selected_skills: 用户指定的技能名称列表（可选）
-        
+        cancel_event: 取消信号事件
+        request_id: 请求 ID（用于取消注册）
+
     Yields:
         JSON 字符串格式的流式数据块
     """
@@ -310,28 +348,41 @@ async def generate_stream_chunks_with_messages(
             processed_messages,
             enable_thinking=enable_thinking,
             storage_messages=storage_messages,
-            selected_skills=selected_skills
+            selected_skills=selected_skills,
+            cancel_event=cancel_event,
         ):
+            # 检查取消信号
+            if cancel_event and cancel_event.is_set():
+                logger.info("[generate_stream_chunks_with_messages] 请求已被取消: request_id=%s", request_id)
+                cancelled_data = json.dumps({"type": "cancelled", "message": "请求已被用户取消", "session_id": actual_session_id}, ensure_ascii=False, default=str)
+                yield f"data: {cancelled_data}\n\n"
+                break
+
             # 确保所有 yield 的都是 JSON 字符串
             if isinstance(chunk, dict):
                 chunk["session_id"] = actual_session_id
             yield f"data: {json.dumps(chunk, ensure_ascii=False, default=str)}\n\n"
+    except asyncio.CancelledError:
+        logger.info("[generate_stream_chunks_with_messages] 请求被取消: request_id=%s", request_id)
     except Exception as e:
         # 记录详细错误信息
         import traceback
         error_traceback = traceback.format_exc()
         logger.error("[generate_stream_chunks_with_messages] 错误：%s", e, exc_info=True)
-        
+
         # 特殊处理：如果错误消息是 "0"，添加更多上下文
         error_message = str(e)
         if error_message == "0":
             error_message = f"数据库操作错误：{e} (类型：{type(e).__name__})"
-        
+
         error_data = json.dumps({"type": "error", "message": error_message, "session_id": actual_session_id}, ensure_ascii=False, default=str)
         yield f"data: {error_data}\n\n"
     finally:
         # 恢复原始模型
         agent_graph.llm = original_llm
+        # 清理取消注册
+        if request_id:
+            cancel_registry.unregister(request_id)
 
 
 def format_response(state_dict: dict) -> dict:
@@ -360,6 +411,7 @@ async def root():
         "endpoints": {
             "chat": "/api/chat",
             "chat_stream": "/api/chat/stream",
+            "chat_cancel": "/api/chat/cancel",
             "health": "/health",
             "skills": "/api/skills",
             "static": "/static/index.html"
@@ -593,7 +645,7 @@ async def chat_stream(request: ChatRequest):
     
     # 收集 OpenAI 兼容参数
     llm_kwargs = _collect_llm_kwargs(request)
-    
+
     # 如果指定了模型或其他参数，创建独立的 LLM 实例
     custom_llm = None
     if request.model or llm_kwargs:
@@ -602,14 +654,23 @@ async def chat_stream(request: ChatRequest):
             enable_thinking=request.enable_thinking,
             **llm_kwargs
         )
-    
+
+    # 注册取消事件
+    cancel_event = None
+    request_id = request.request_id
+    if request_id:
+        cancel_event = cancel_registry.register(request_id)
+        logger.info("[chat_stream] 注册取消事件: request_id=%s", request_id)
+
     return StreamingResponse(
         generate_stream_chunks_with_messages(
             request.messages,
             session_id=request.session_id,
             custom_llm=custom_llm,
             enable_thinking=request.enable_thinking,
-            selected_skills=request.selected_skills
+            selected_skills=request.selected_skills,
+            cancel_event=cancel_event,
+            request_id=request_id,
         ),
         media_type="text/event-stream",
         headers={
@@ -618,6 +679,37 @@ async def chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no"
         }
     )
+
+
+class CancelRequest(BaseModel):
+    """取消请求模型"""
+    request_id: str = Field(..., description="要取消的请求 ID")
+
+
+@app.post("/api/chat/cancel")
+async def cancel_chat(request: CancelRequest):
+    """
+    取消正在进行的聊天请求
+
+    通过请求 ID 取消一个正在进行的流式聊天请求。
+    请求 ID 在发起聊天请求时通过 request_id 字段指定。
+
+    示例：
+    ```json
+    {
+        "request_id": "my-request-123"
+    }
+    ```
+    """
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=503, detail="系统正在初始化中")
+
+    success = cancel_registry.cancel(request.request_id)
+    if success:
+        logger.info("[cancel_chat] 已发送取消信号: request_id=%s", request.request_id)
+        return {"status": "cancelled", "request_id": request.request_id}
+
+    raise HTTPException(status_code=404, detail=f"未找到活跃请求: {request.request_id}")
 
 
 @app.get("/api/skills")

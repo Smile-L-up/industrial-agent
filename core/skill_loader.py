@@ -315,6 +315,9 @@ class SkillLoader:
         elif config and config.get("service"):
             # ── 配置模式：无 tool.py，但 SKILL.md 中声明了 service ──
             skill = self._create_service_skill(skill_name, config)
+        elif config and config.get("mcp"):
+            # ── MCP 模式：无 tool.py，但 SKILL.md 中声明了 mcp ──
+            skill = self._create_service_skill(skill_name, config)
         else:
             logger.error("技能 %s 既没有 tool.py 也没有 service 配置", skill_name)
             return None
@@ -379,7 +382,7 @@ class SkillLoader:
 
         # 提取 HTTP 服务配置（配置模式技能）
         service_type = front_matter.get("service_type", "")
-        if service_type:
+        if service_type in ("http", "dify"):
             config["service"] = {
                 "type": service_type,
                 "endpoint": front_matter.get("endpoint", ""),
@@ -389,6 +392,11 @@ class SkillLoader:
                 "inputs": front_matter.get("inputs", {}),
                 "body_template": front_matter.get("body_template", {}),
                 "response_path": front_matter.get("response_path", ""),
+            }
+        elif service_type == "mcp":
+            config["mcp"] = {
+                "endpoint": front_matter.get("endpoint", ""),
+                "timeout": front_matter.get("timeout", 120),
             }
 
         return config
@@ -443,8 +451,8 @@ class SkillLoader:
         """
         根据 service 配置创建 HTTP 服务技能实例（配置模式，无需 tool.py）。
         """
-        service = config.get("service", {})
-        service_type = service.get("type", "http")
+        service = config.get("service")
+        service_type = service.get("type", "http") if service else None
 
         if service_type in ("http", "dify"):
             from core.http_skill import HttpSkill
@@ -453,6 +461,13 @@ class SkillLoader:
             except Exception as e:
                 logger.error("实例化 HTTP 技能 %s 失败：%s", skill_name, e, exc_info=True)
                 return None
+        elif service_type == "mcp" or config.get("mcp"):
+            from core.mcp_skill import McpSkill
+            try:
+                return McpSkill(config)
+            except Exception as e:
+                logger.error("实例化 MCP 技能 %s 失败：%s", skill_name, e, exc_info=True)
+                return None
         else:
-            logger.error("技能 %s 的 service_type '%s' 不受支持（支持：http, dify）", skill_name, service_type)
+            logger.error("技能 %s 的 service_type '%s' 不受支持（支持：http, dify, mcp）", skill_name, service_type)
             return None
