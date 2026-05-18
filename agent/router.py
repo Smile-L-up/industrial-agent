@@ -8,7 +8,7 @@ Router - 路由器
   - 技能按需加载，路由阶段不加载 tool.py
 """
 
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from .state import AgentState, Task
 from core.skill_loader import SkillMetadata
 from core.logger import get_logger
@@ -45,7 +45,8 @@ class Router:
 
 用户任务：{task}
 
-请只输出技能名称。如果没有合适的技能，输出 None。"""
+如果有匹配的技能，只输出技能名称。
+如果没有匹配的技能，直接输出回答内容。"""
 
     def update_metadata(self, metadata_list: List[SkillMetadata]):
         """更新技能元数据列表"""
@@ -164,3 +165,147 @@ class Router:
             return None
 
         return None
+
+    # ── 流式合并路由 ──────────────────────────────────
+
+    async def route_stream(
+        self,
+        task_description: str,
+        messages: list,
+        enable_thinking: Optional[bool] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        流式合并路由：一次 LLM 调用同时完成路由和回答。
+
+        - 如果匹配到技能 → yield {"type": "skill_match", "skill": name}
+        - 如果无匹配 → yield {"type": "token", "content": ...} 逐 token 输出回答
+
+        Args:
+            task_description: 用户任务描述
+            messages: 完整对话历史（用于直接回答时构建上下文）
+            enable_thinking: 是否启用思考模式
+        """
+        if not self.llm:
+            yield {"type": "token", "content": "抱歉，我暂时无法处理这个问题。"}
+            return
+
+        # ── 无技能 → 直接流式回答 ──
+        if not self.metadata_list:
+            async for chunk in self._stream_answer(messages, enable_thinking):
+                yield chunk
+            return
+
+        # ── 有技能 → 流式路由 + 按需回答 ──
+        skills_info = "\n".join(
+            [f"- {m.name}: {m.description}" for m in self.metadata_list]
+        )
+        prompt = self.prompt_template.format(
+            skills=skills_info,
+            task=task_description,
+        )
+
+        from llm.llm import Message
+        llm_messages = [Message(role="user", content=prompt)]
+
+        buffer = ""
+        matched_skill = None
+
+        try:
+            async for chunk in self.llm.chat_stream(
+                llm_messages, enable_thinking=enable_thinking
+            ):
+                if chunk.get("type") == "reasoning_content":
+                    continue
+
+                if chunk.get("type") != "content":
+                    continue
+
+                token = chunk["content"]
+                buffer += token
+
+                # 已确认匹配到技能 → 不再输出
+                if matched_skill is not None:
+                    continue
+
+                # 尝试匹配技能名（精确或包含）
+                skill = self._try_match_skill(buffer.strip())
+                if skill:
+                    matched_skill = skill
+                    logger.info("流式路由匹配到技能：%s", skill)
+                    yield {"type": "skill_match", "skill": skill}
+                    continue
+
+                # 检查是否已确定不是技能名（出现空格/标点且无匹配）
+                # 技能名都是单词/下划线，一旦出现其他字符就确认是回答
+                if self._is_confirmed_answer(buffer):
+                    # 缓冲的内容是回答，输出给客户端
+                    for ch in buffer:
+                        yield {"type": "token", "content": ch}
+                    buffer = ""  # 已全部输出，清空
+
+            # 流结束：如果既没匹配技能也没确认为回答
+            if matched_skill is None:
+                remaining = buffer
+                if remaining:
+                    # 最终检查
+                    skill = self._try_match_skill(remaining.strip())
+                    if skill:
+                        logger.info("流式路由匹配到技能（末尾）：%s", skill)
+                        yield {"type": "skill_match", "skill": skill}
+                    else:
+                        for ch in remaining:
+                            yield {"type": "token", "content": ch}
+
+        except Exception as e:
+            logger.error("流式路由失败：%s", e, exc_info=True)
+            yield {"type": "token", "content": "抱歉，处理请求时出现问题。"}
+
+    def _try_match_skill(self, text: str) -> Optional[str]:
+        """尝试将文本匹配到已知技能名"""
+        text = text.strip().strip('"').strip("'")
+        for meta in self.metadata_list:
+            if meta.name == text or meta.name.lower() == text.lower():
+                return meta.name
+        return None
+
+    def _is_confirmed_answer(self, buffer: str) -> bool:
+        """
+        判断缓冲内容是否已确认为「回答」（而非技能名）。
+        技能名只包含字母、数字、下划线、中文，不含空格和标点。
+        一旦 buffer 中出现空格或标点，且不匹配任何技能名，就是回答。
+        """
+        import re
+        stripped = buffer.strip()
+        if not stripped:
+            return False
+        # 包含空格或常见标点 → 不可能是技能名
+        if re.search(r"[\s,.!?;:，。！？；：]", stripped):
+            return True
+        # 长度超过最长技能名 → 不可能是技能名
+        max_name_len = max((len(m.name) for m in self.metadata_list), default=0)
+        if len(stripped) > max_name_len + 5:
+            return True
+        return False
+
+    async def _stream_answer(
+        self,
+        messages: list,
+        enable_thinking: Optional[bool] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """用 LLM 流式直接回答（无技能场景）"""
+        from llm.llm import Message
+
+        llm_messages = [
+            Message(role=msg.get("role", "user"), content=msg.get("content", ""))
+            for msg in messages
+        ]
+
+        async for chunk in self.llm.chat_stream(llm_messages, enable_thinking=enable_thinking):
+            if isinstance(chunk, dict):
+                chunk_type = chunk.get("type")
+                if chunk_type == "reasoning_content":
+                    yield {"type": "reasoning_content", "content": chunk["content"]}
+                elif chunk_type == "content":
+                    yield {"type": "token", "content": chunk["content"]}
+            else:
+                yield {"type": "token", "content": chunk}

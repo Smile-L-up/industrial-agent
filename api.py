@@ -373,7 +373,7 @@ async def health_check():
     return {
         "status": "healthy" if app_state["initialized"] else "initializing",
         "llm": "ready" if app_state["llm"] else "not ready",
-        "skills_count": len(app_state["metadata_list"]) if app_state["metadata_list"] else 0
+        "skills_count": len(app_state.get("metadata_list") or [])
     }
 
 

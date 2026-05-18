@@ -251,27 +251,45 @@ class AgentGraph:
             description=user_input
         ))
 
-        state = await self.router.route(state)
+        # ── 用户指定技能：跳过 LLM 路由 ──
+        user_selected_skills = state.context.get("selected_skills")
+        if user_selected_skills:
+            selected = self.router._match_user_skills(user_selected_skills)
+            if selected:
+                logger.info("使用用户指定的技能：%s", selected)
+                state.context["selected_skill"] = selected
+                state.current_tool = selected
+            else:
+                logger.warning("用户指定的技能均无效：%s", user_selected_skills)
 
-        # ── 无匹配技能 → LLM 直接流式回答 ──
+        # ── 流式合并路由：路由 + 无匹配时直接回答 ──
         if not state.current_tool:
             full_response = ""
-            async for chunk in self._stream_direct_response(state, enable_thinking):
-                chunk_type = chunk.get("type")
-                if chunk_type == "token":
+            async for chunk in self.router.route_stream(
+                user_input, state.messages, enable_thinking=enable_thinking
+            ):
+                if chunk["type"] == "skill_match":
+                    skill = chunk["skill"]
+                    state.context["selected_skill"] = skill
+                    state.current_tool = skill
+                    logger.info("流式路由匹配到技能：%s", skill)
+                    break
+                elif chunk["type"] == "token":
                     full_response += chunk["content"]
                     yield chunk
-                elif chunk_type == "reasoning_content":
+                elif chunk["type"] == "reasoning_content":
                     yield chunk
 
-            state.add_message("assistant", full_response)
-            state.final_result = full_response
-            state.is_complete = True
-            self._save_user_messages_to_db(storage_messages, messages)
-            self._save_assistant_response_to_db(state)
-            await handler.emit(EventType.COMPLETE, state.to_dict())
-            yield {"type": "complete", "content": full_response}
-            return
+            # 无匹配技能 → 回答已通过上面的 token 流式输出
+            if not state.current_tool:
+                state.add_message("assistant", full_response)
+                state.final_result = full_response
+                state.is_complete = True
+                self._save_user_messages_to_db(storage_messages, messages)
+                self._save_assistant_response_to_db(state)
+                await handler.emit(EventType.COMPLETE, state.to_dict())
+                yield {"type": "complete", "content": full_response}
+                return
 
         # ── 有匹配技能 → executor 执行 ──
         yield {"type": "tool_call", "name": state.current_tool, "args": {}}
