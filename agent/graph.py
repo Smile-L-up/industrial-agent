@@ -246,10 +246,12 @@ class AgentGraph:
         state, user_input, handler = await self._prepare_state(messages, selected_skills=selected_skills)
 
         # 添加任务
-        state.add_task(Task(
+        task = Task(
             id=str(uuid.uuid4()),
             description=user_input
-        ))
+        )
+        state.add_task(task)
+        state.current_task = task
 
         # ── 用户指定技能：跳过 LLM 路由 ──
         user_selected_skills = state.context.get("selected_skills")

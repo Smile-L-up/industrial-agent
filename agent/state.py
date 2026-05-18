@@ -135,7 +135,15 @@ class ExecutionContext:
             val = getattr(self, fld_name)
             if val is not None:
                 result[fld_name] = val
-        result.update(self.extra)
+        for k, v in self.extra.items():
+            if k.startswith("_"):
+                continue
+            try:
+                import json as _json
+                _json.dumps(v)
+                result[k] = v
+            except (TypeError, ValueError):
+                continue
         return result
 
 
