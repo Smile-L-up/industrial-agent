@@ -12,6 +12,7 @@ import inspect
 from typing import Any, Dict, Optional, AsyncGenerator, List
 from .state import AgentState
 from core.skill_loader import SkillLoader
+from core.composite_skill import CompositeSkill
 from core.logger import get_logger
 
 logger = get_logger("agent.executor")
@@ -139,6 +140,12 @@ class Executor:
         对配置模式技能（有 inputs 但无子工具），先用 LLM 提取结构化参数。
         """
         try:
+            # ── 复合技能：按步骤编排执行 ──
+            if isinstance(skill, CompositeSkill) or (
+                hasattr(skill, "_steps") and skill._steps
+            ):
+                return await self._execute_composite(skill, state)
+
             # 注入 LLM 到 context，供 HttpSkill 等配置模式技能使用
             if self.llm:
                 state.context["_llm"] = self.llm
@@ -178,6 +185,78 @@ class Executor:
             logger.error("技能执行失败：%s", e, exc_info=True)
             state.set_error(f"技能执行失败：{str(e)}")
             return f"执行失败：{str(e)}"
+
+    # ── 复合技能执行 ──────────────────────────────────
+
+    async def _execute_composite(self, skill: Any, state: AgentState) -> str:
+        """
+        执行复合技能：按 steps 顺序串联执行子技能，
+        前一步的结果自动注入到后续步骤的参数模板中。
+        """
+        try:
+            if self.llm:
+                state.context["_llm"] = self.llm
+
+            result = await skill.execute(
+                task=state.current_task.description,
+                context=state.context,
+                messages=state.messages,
+            )
+            return result
+        except Exception as e:
+            logger.error("复合技能执行失败：%s", e, exc_info=True)
+            state.set_error(f"复合技能执行失败：{str(e)}")
+            return f"执行失败：{str(e)}"
+
+    async def _execute_composite_stream(
+        self,
+        skill: Any,
+        state: AgentState,
+        enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """复合技能流式执行：执行后用 LLM 流式生成最终回复"""
+        try:
+            if self.llm:
+                state.context["_llm"] = self.llm
+
+            # 执行复合技能（内部串联子技能）
+            result = await skill.execute(
+                task=state.current_task.description,
+                context=state.context,
+                messages=state.messages,
+            )
+
+            state.execution_record.add_tool_result(
+                tool=state.context.get("selected_skill", "composite"),
+                result=result,
+                success=True,
+            )
+
+            # 用 LLM 流式生成自然语言回复
+            if self.llm:
+                async for chunk in self._generate_response_with_tool_result_stream(
+                    state.current_task.description,
+                    state.context.get("selected_skill", "composite"),
+                    result,
+                    enable_thinking,
+                    cancel_event=cancel_event,
+                ):
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    chunk_type = chunk.get("type")
+                    chunk_content = chunk.get("content", "")
+                    if chunk_type == "reasoning_content":
+                        if enable_thinking is not False:
+                            yield {"type": "reasoning_content", "content": chunk_content}
+                    elif chunk_type == "token":
+                        yield {"type": "token", "content": chunk_content}
+            else:
+                yield {"type": "token", "content": str(result)}
+
+        except Exception as e:
+            logger.error("复合技能流式执行失败：%s", e, exc_info=True)
+            yield {"type": "error", "content": f"复合技能执行失败：{str(e)}"}
 
     # ── 子工具选择 ────────────────────────────────────
 
@@ -559,6 +638,17 @@ JSON："""
         if selected_skill_name:
             skill = self._find_skill(selected_skill_name)
             if skill:
+                # ── 复合技能流式执行 ──
+                if isinstance(skill, CompositeSkill) or (
+                    hasattr(skill, "_steps") and skill._steps
+                ):
+                    async for chunk in self._execute_composite_stream(
+                        skill, state, enable_thinking=enable_thinking,
+                        cancel_event=cancel_event
+                    ):
+                        yield chunk
+                    return
+
                 # ── 子工具流式路径 ──
                 tools: List[Dict] = []
                 if hasattr(skill, "get_tools") and callable(skill.get_tools):

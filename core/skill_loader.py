@@ -84,8 +84,11 @@ def _fallback_parse_yaml(yaml_text: str) -> Dict[str, Any]:
         def _save_pending_list():
             """将挂起的列表保存到 result"""
             nonlocal current_list, current_key
-            if current_list is not None and current_key is not None:
-                result[current_key] = current_list
+            if current_list is not None:
+                if current_key is not None:
+                    result[current_key] = current_list
+                else:
+                    result["_unnamed_list"] = current_list
                 current_list = None
 
         while i < len(lines):
@@ -107,7 +110,12 @@ def _fallback_parse_yaml(yaml_text: str) -> Dict[str, Any]:
             if indent > base_indent:
                 if current_key is not None:
                     sub_value, i = _parse_block(lines, i, indent)
-                    if current_list is not None:
+                    # 子块返回的未命名列表 → 归属到当前 key
+                    if "_unnamed_list" in sub_value:
+                        result[current_key] = sub_value.pop("_unnamed_list")
+                        if sub_value:
+                            result[current_key] = sub_value
+                    elif current_list is not None:
                         # 列表模式：追加到最后一项或新建
                         if current_list and isinstance(current_list[-1], dict):
                             current_list[-1].update(sub_value)
@@ -177,6 +185,10 @@ def _fallback_parse_yaml(yaml_text: str) -> Dict[str, Any]:
 
         # 循环结束，保存挂起的列表
         _save_pending_list()
+
+        # 仅在顶层清理内部标记键（递归调用时需保留给外层处理）
+        if base_indent == 0:
+            result.pop("_unnamed_list", None)
 
         return result, i
 
@@ -308,10 +320,17 @@ class SkillLoader:
         # 加载工具模块
         tool_module = self._load_tool_module(skill_path, skill_name)
 
+        # 注入 skill_loader 引用，供复合技能加载子技能
+        if config:
+            config["_skill_loader"] = self
+
         skill = None
         if tool_module:
             # ── 代码模式：tool.py 存在 ──
             skill = self._create_skill_instance(skill_name, config or {}, tool_module)
+        elif config and config.get("type") == "composite":
+            # ── 复合模式：无 tool.py，SKILL.md 中声明了 type: composite ──
+            skill = self._create_composite_skill(skill_name, config)
         elif config and config.get("service"):
             # ── 配置模式：无 tool.py，但 SKILL.md 中声明了 service ──
             skill = self._create_service_skill(skill_name, config)
@@ -379,6 +398,15 @@ class SkillLoader:
             "keywords": front_matter.get("keywords", []),
             "raw_content": _strip_front_matter(content),
         }
+
+        # 复合技能配置
+        skill_type = front_matter.get("type", "")
+        if skill_type:
+            config["type"] = skill_type
+        if front_matter.get("sub_skills"):
+            config["sub_skills"] = front_matter["sub_skills"]
+        if front_matter.get("steps"):
+            config["steps"] = front_matter["steps"]
 
         # 提取 HTTP 服务配置（配置模式技能）
         service_type = front_matter.get("service_type", "")
@@ -470,4 +498,30 @@ class SkillLoader:
                 return None
         else:
             logger.error("技能 %s 的 service_type '%s' 不受支持（支持：http, dify, mcp）", skill_name, service_type)
+            return None
+
+    def _create_composite_skill(self, skill_name: str, config: Dict) -> Optional[Any]:
+        """
+        创建复合技能实例（配置模式，无需 tool.py）。
+        如果技能目录下有 tool.py 且其中定义了 Skill 类，则优先使用自定义实现。
+        """
+        from core.composite_skill import CompositeSkill
+
+        # 检查是否有自定义 tool.py 实现
+        skill_path = Path(config.get("path", self.skills_dir / skill_name))
+        tool_module = self._load_tool_module(skill_path, skill_name)
+        if tool_module and hasattr(tool_module, "Skill"):
+            skill_cls = tool_module.Skill
+            if isinstance(skill_cls, type) and issubclass(skill_cls, CompositeSkill):
+                try:
+                    return skill_cls(config)
+                except Exception as e:
+                    logger.error("实例化复合技能 %s 失败：%s", skill_name, e, exc_info=True)
+                    return None
+
+        # 使用默认 CompositeSkill
+        try:
+            return CompositeSkill(config)
+        except Exception as e:
+            logger.error("实例化复合技能 %s 失败：%s", skill_name, e, exc_info=True)
             return None
