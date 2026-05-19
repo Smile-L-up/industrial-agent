@@ -530,6 +530,12 @@
                                             if (parsed.sub_tool) {
                                                 toolCallInfo += ' → ' + parsed.sub_tool;
                                             }
+                                            // 子技能调用（复合技能步骤）
+                                            if (parsed.args && parsed.args.step) {
+                                                const stepInfo = `[${parsed.args.step}] ${parsed.name}`;
+                                                const stepDesc = parsed.args.description || '';
+                                                addStatusMessage(`🔧 调用子技能 ${stepInfo}${stepDesc ? '：' + stepDesc : ''}`);
+                                            }
                                             break;
                                             
                                         case 'complete':

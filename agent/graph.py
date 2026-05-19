@@ -330,6 +330,8 @@ class AgentGraph:
             elif chunk_type == "token":
                 full_response += chunk["content"]
                 yield {"type": "token", "content": chunk["content"]}
+            elif chunk_type == "tool_call":
+                yield chunk
             elif chunk_type == "tool_result":
                 sub_tool = state.context.get("current_subtool")
                 await handler.emit(EventType.TOOL_RESULT, {
@@ -337,6 +339,8 @@ class AgentGraph:
                     "sub_tool": sub_tool,
                     "result": chunk.get("result")
                 })
+            elif chunk_type == "status":
+                yield chunk
             elif chunk_type == "error":
                 yield chunk
             elif chunk_type == "cancelled":

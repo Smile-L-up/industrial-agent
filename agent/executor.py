@@ -215,17 +215,68 @@ class Executor:
         enable_thinking: Optional[bool] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """复合技能流式执行：执行后用 LLM 流式生成最终回复"""
+        """复合技能流式执行：逐个输出子技能调用状态，最后用 LLM 流式生成回复"""
         try:
             if self.llm:
                 state.context["_llm"] = self.llm
 
-            # 执行复合技能（内部串联子技能）
-            result = await skill.execute(
-                task=state.current_task.description,
-                context=state.context,
-                messages=state.messages,
-            )
+            # ── 第 1 步：LLM 规划 ──
+            from llm.llm import Message
+            import json as _json
+
+            sub_skills_info = skill._collect_sub_skills_info()
+            if not sub_skills_info:
+                yield {"type": "error", "content": "无法加载任何子技能"}
+                return
+
+            plan_prompt = skill._build_plan_prompt(state.current_task.description, sub_skills_info)
+            plan_response = await self.llm.chat([Message(role="user", content=plan_prompt)])
+            plan = skill._parse_plan(plan_response.content)
+
+            if not plan:
+                yield {"type": "token", "content": plan_response.content}
+                return
+
+            logger.info("复合技能执行计划：%s", _json.dumps(plan, ensure_ascii=False))
+
+            # ── 第 2 步：逐个执行子技能，每次执行前 yield tool_call ──
+            results = []
+            for i, step in enumerate(plan):
+                if cancel_event and cancel_event.is_set():
+                    yield {"type": "cancelled", "content": "请求已被用户取消"}
+                    return
+
+                skill_name = step.get("skill", "")
+                args = step.get("args", {})
+                desc = step.get("description", skill_name)
+
+                yield {
+                    "type": "tool_call",
+                    "name": skill_name,
+                    "args": {"step": f"{i + 1}/{len(plan)}", "description": desc},
+                }
+
+                sub_skill = skill._load_sub_skill(skill_name)
+                if not sub_skill:
+                    results.append({"step": desc, "skill": skill_name, "error": "子技能加载失败"})
+                    continue
+
+                sub_result = await skill._execute_sub_skill(
+                    sub_skill, state.current_task.description, state.context, state.messages, args
+                )
+                results.append({
+                    "step": desc,
+                    "skill": skill_name,
+                    "args": args,
+                    "result": sub_result if len(str(sub_result)) < 2000 else str(sub_result)[:2000],
+                })
+
+            logger.info("子技能执行完毕，共 %d 步", len(results))
+
+            # ── 第 3 步：LLM 整合结果 ──
+            answer_prompt = skill._build_answer_prompt(state.current_task.description, results)
+            answer_response = await self.llm.chat([Message(role="user", content=answer_prompt)])
+            result = answer_response.content
 
             state.execution_record.add_tool_result(
                 tool=state.context.get("selected_skill", "composite"),
@@ -735,11 +786,18 @@ JSON："""
                     )
                     if selected_tool:
                         state.context["current_subtool"] = selected_tool
-                        city = _get_city_from_input(state.current_task.description)
 
-                        tool_result_data = await self._get_tool_result(
-                            skill, selected_tool, city
-                        )
+                        # 使用通用参数提取
+                        arguments = self._extract_tool_arguments(skill, selected_tool, state.current_task.description)
+                        from core.base_skill import BaseSkill
+                        if isinstance(skill, BaseSkill):
+                            tool_result_data = await skill.call_tool(
+                                tool_name=selected_tool,
+                                arguments=arguments,
+                                context=state.context.to_dict(),
+                            )
+                        else:
+                            tool_result_data = await self._get_tool_result(skill, selected_tool, None)
 
                         state.execution_record.add_tool_result(
                             tool=selected_skill_name,
