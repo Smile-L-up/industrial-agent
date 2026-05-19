@@ -373,22 +373,24 @@ JSON："""
         """调用技能的子工具方法"""
         try:
             state.context["current_subtool"] = tool_name
+            task = state.current_task.description
 
             # 优先使用 BaseSkill.call_tool() 接口
             from core.base_skill import BaseSkill
             if isinstance(skill, BaseSkill):
                 try:
-                    # 尝试从任务中提取参数
-                    arguments = {}
-                    city = _get_city_from_input(state.current_task.description)
-                    if city:
-                        arguments["city"] = city
-
+                    arguments = self._extract_tool_arguments(skill, tool_name, task)
                     result = await skill.call_tool(
                         tool_name=tool_name,
                         arguments=arguments,
                         context=state.context.to_dict(),
                     )
+                    # 如果工具返回了错误，回退到 execute
+                    if isinstance(result, dict) and result.get("success") is False:
+                        logger.info("子工具 %s 返回错误，回退到 execute: %s", tool_name, result.get("error"))
+                        return await skill.execute(
+                            task=task, context=state.context, messages=state.messages,
+                        )
                     return self._format_tool_result(tool_name, result)
                 except AttributeError:
                     logger.warning("BaseSkill.call_tool 未找到子工具 %s，回退到 execute", tool_name)
@@ -398,21 +400,23 @@ JSON："""
                 method = getattr(skill, tool_name)
                 if callable(method):
                     sig = inspect.signature(method)
-                    params = list(sig.parameters.keys())
+                    params = [p for p in sig.parameters.keys() if p not in ("self", "kwargs", "context", "messages")]
 
-                    city = _get_city_from_input(state.current_task.description)
-                    if city and "city" in params:
+                    arguments = self._extract_tool_arguments(skill, tool_name, task)
+                    call_args = {k: v for k, v in arguments.items() if k in params}
+                    if call_args:
                         if inspect.iscoroutinefunction(method):
-                            result = await method(city)
+                            result = await method(**call_args)
                         else:
-                            result = method(city)
-                        return self._format_tool_result(tool_name, result)
+                            result = method(**call_args)
+                        if isinstance(result, dict) and result.get("success") is False:
+                            logger.info("子工具 %s 返回错误，回退到 execute", tool_name)
+                        else:
+                            return self._format_tool_result(tool_name, result)
 
             # 兜底回退到 execute
             return await skill.execute(
-                task=state.current_task.description,
-                context=state.context,
-                messages=state.messages,
+                task=task, context=state.context, messages=state.messages,
             )
         except Exception as e:
             logger.error("子工具调用失败：%s", e, exc_info=True)
@@ -421,6 +425,77 @@ JSON："""
                 context=state.context,
                 messages=state.messages,
             )
+
+    def _extract_tool_arguments(self, skill: Any, tool_name: str, task: str) -> Dict[str, Any]:
+        """根据工具参数定义从用户输入中提取参数"""
+        arguments = {}
+
+        # 获取工具期望的参数列表
+        expected_params = set()
+        if hasattr(skill, "get_tools") and callable(skill.get_tools):
+            for t in skill.get_tools():
+                if t.get("name") == tool_name:
+                    params = t.get("parameters", {})
+                    if isinstance(params, dict):
+                        expected_params = set(params.keys())
+                    break
+
+        # 如果没找到参数定义，检查方法签名
+        if not expected_params and hasattr(skill, tool_name):
+            method = getattr(skill, tool_name)
+            if callable(method):
+                sig = inspect.signature(method)
+                expected_params = {
+                    p for p in sig.parameters.keys()
+                    if p not in ("self", "kwargs", "context", "messages")
+                }
+
+        # 根据期望参数提取值
+        for param in expected_params:
+            if param == "city":
+                city = _get_city_from_input(task)
+                if city:
+                    arguments["city"] = city
+            elif param == "expression":
+                expr = self._extract_expression(task)
+                if expr:
+                    arguments["expression"] = expr
+
+        logger.debug("工具 %s 参数提取: expected=%s, extracted=%s", tool_name, expected_params, arguments)
+        return arguments
+
+    @staticmethod
+    def _extract_expression(text: str) -> Optional[str]:
+        """从用户输入中提取数学表达式"""
+        import re
+        # 移除常见中文词汇，保留运算符和数字
+        # 按长度降序排列，确保 "乘以" 先于 "乘" 被替换
+        replacements = [
+            ("乘以", "*"), ("除以", "/"), ("等于", "="),
+            ("是多少", ""), ("算一下", ""),
+            ("加", "+"), ("减", "-"), ("乘", "*"), ("除", "/"),
+            ("多少", ""), ("计算", ""), ("算算", ""), ("请问", ""), ("帮我", ""), ("求", ""),
+        ]
+        expr = text
+        for cn, en in replacements:
+            expr = expr.replace(cn, en)
+
+        # 匹配包含数字和运算符的表达式
+        pattern = r'[\d\.\+\-\*\/\(\)\s]+'
+        matches = re.findall(pattern, expr)
+        if matches:
+            expr = max(matches, key=len).strip()
+            if re.search(r'[\+\-\*\/]', expr):
+                return expr
+
+        # 从原始文本中尝试提取
+        matches = re.findall(pattern, text)
+        if matches:
+            expr = max(matches, key=len).strip()
+            if re.search(r'[\+\-\*\/]', expr):
+                return expr
+
+        return None
 
     # ── 结果格式化 ────────────────────────────────────
 

@@ -10,7 +10,7 @@ services:
     image: industrial-agent:latest  # 使用已构建的镜像
     container_name: industrial-agent
     ports:
-      - "18002:18000"
+      - "18000:18000"
     environment:
       # ==================== LLM 配置 ====================
       - DASHSCOPE_API_KEY=sk-da3613b86fe84367926bcda009297dac

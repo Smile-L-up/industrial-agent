@@ -208,7 +208,22 @@ class Router:
         )
 
         from llm.llm import Message
-        llm_messages = [Message(role="user", content=prompt)]
+
+        # 构建路由消息：完整对话历史 + 路由指令（含图片）
+        routing_content = [{"type": "text", "text": prompt}]
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "image_url":
+                            routing_content.append(item)
+
+        llm_messages = [
+            Message(role=msg.get("role", "user"), content=msg.get("content", ""))
+            for msg in messages
+        ]
+        llm_messages.append(Message(role="user", content=routing_content))
 
         buffer = ""
         matched_skill = None
@@ -270,6 +285,17 @@ class Router:
         except Exception as e:
             logger.error("流式路由失败：%s", e, exc_info=True)
             yield {"type": "token", "content": "抱歉，处理请求时出现问题。"}
+
+    @staticmethod
+    def _has_image_content(messages: list) -> bool:
+        """检查消息列表中是否包含图片内容"""
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        return True
+        return False
 
     def _try_match_skill(self, text: str) -> Optional[str]:
         """尝试将文本匹配到已知技能名"""
