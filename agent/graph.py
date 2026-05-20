@@ -310,6 +310,7 @@ class AgentGraph:
                 return
 
         # ── 有匹配技能 → executor 执行 ──
+        logger.info("[graph] 开始执行技能：%s", state.current_tool)
         yield {"type": "tool_call", "name": state.current_tool, "args": {}}
 
         full_response = ""
@@ -331,17 +332,23 @@ class AgentGraph:
                 full_response += chunk["content"]
                 yield {"type": "token", "content": chunk["content"]}
             elif chunk_type == "tool_call":
+                logger.info("[graph] 子工具调用：%s", chunk.get("name"))
                 yield chunk
             elif chunk_type == "tool_result":
                 sub_tool = state.context.get("current_subtool")
+                logger.info("[graph] 工具结果返回：%s → %s（结果长度: %d）",
+                            state.current_tool, sub_tool, len(str(chunk.get("result", ""))))
                 await handler.emit(EventType.TOOL_RESULT, {
                     "tool": state.current_tool,
                     "sub_tool": sub_tool,
                     "result": chunk.get("result")
                 })
+                yield chunk
             elif chunk_type == "status":
+                logger.info("[graph] 状态：%s", chunk.get("content"))
                 yield chunk
             elif chunk_type == "error":
+                logger.error("[graph] 错误：%s", chunk.get("content"))
                 yield chunk
             elif chunk_type == "cancelled":
                 yield chunk

@@ -764,10 +764,13 @@ JSON："""
         if selected_skill_name:
             skill = self._find_skill(selected_skill_name)
             if skill:
+                logger.info("[executor] 已加载技能：%s (类型: %s)", selected_skill_name, type(skill).__name__)
+
                 # ── 复合技能流式执行 ──
                 if isinstance(skill, CompositeSkill) or (
                     hasattr(skill, "_steps") and skill._steps
                 ):
+                    logger.info("[executor] 走复合技能路径")
                     async for chunk in self._execute_composite_stream(
                         skill, state, enable_thinking=enable_thinking,
                         cancel_event=cancel_event
@@ -781,6 +784,7 @@ JSON："""
                     tools = skill.get_tools()
 
                 if tools:
+                    logger.info("[executor] 走子工具路径，工具数: %d", len(tools))
                     selected_tool = self._simple_tool_match(
                         state.current_task.description, tools
                     )
@@ -843,6 +847,7 @@ JSON："""
                 # ── 配置模式技能（如 HttpSkill）：LLM 提取参数 + 调用服务 ──
                 skill_inputs = getattr(skill, "_inputs", None)
                 if skill_inputs:
+                    logger.info("[executor] 走配置模式路径，inputs: %s", list(skill_inputs.keys()))
                     if self.llm:
                         state.context["_llm"] = self.llm
 
@@ -875,6 +880,9 @@ JSON："""
                         result=result,
                         success=True,
                     )
+
+                    logger.info("[executor] 技能执行完成：%s（结果长度: %d）", selected_skill_name, len(str(result)))
+                    yield {"type": "tool_result", "name": selected_skill_name, "result": result}
 
                     # 流式输出结果
                     if self.llm:

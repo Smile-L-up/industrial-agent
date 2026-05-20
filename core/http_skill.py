@@ -63,8 +63,11 @@ class HttpSkill(BaseSkill):
         context: Dict[str, Any],
         messages: List[Dict[str, str]],
     ) -> str:
+        logger.info("[HttpSkill] 开始执行：%s → %s", self._name, self._endpoint)
+
         # 1. 优先使用 executor 层预提取的参数（LLM tool calling 结果）
         params = self._get_extracted_args(context)
+        logger.info("[HttpSkill] executor 预提取参数：%s", params)
 
         # 2. 如果 executor 没有预提取，HttpSkill 自行提取
         if not params:
@@ -88,7 +91,10 @@ class HttpSkill(BaseSkill):
 
         # 4. 构建请求体、调用、返回
         body = self._build_body(params)
+        logger.info("[HttpSkill] 最终参数：%s", params)
+        logger.info("[HttpSkill] 请求体：%s", json.dumps(body, ensure_ascii=False)[:500])
         result = await self._call_service(body)
+        logger.info("[HttpSkill] 响应结果（前200字符）：%s", str(result)[:200])
         return self._format_result(result)
 
     # ── 参数提取 ──────────────────────────────────────
