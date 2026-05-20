@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, AsyncGenerator, List
 from .state import AgentState
 from core.skill_loader import SkillLoader
 from core.composite_skill import CompositeSkill
+from core.multi_service_skill import MultiServiceSkill
 from core.logger import get_logger
 
 logger = get_logger("agent.executor")
@@ -140,8 +141,8 @@ class Executor:
         对配置模式技能（有 inputs 但无子工具），先用 LLM 提取结构化参数。
         """
         try:
-            # ── 复合技能：按步骤编排执行 ──
-            if isinstance(skill, CompositeSkill) or (
+            # ── 复合技能 / 多服务技能：按步骤编排执行 ──
+            if isinstance(skill, (CompositeSkill, MultiServiceSkill)) or (
                 hasattr(skill, "_steps") and skill._steps
             ):
                 return await self._execute_composite(skill, state)
@@ -310,6 +311,111 @@ class Executor:
         except Exception as e:
             logger.error("复合技能流式执行失败：%s", e, exc_info=True)
             yield {"type": "error", "content": f"复合技能执行失败：{str(e)}"}
+
+    async def _execute_multi_service_stream(
+        self,
+        skill: MultiServiceSkill,
+        state: AgentState,
+        enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """多服务技能流式执行：LLM 规划 → 逐个调用服务 → LLM 整合"""
+        try:
+            if self.llm:
+                state.context["_llm"] = self.llm
+
+            # ── 第 1 步：LLM 规划 ──
+            from llm.llm import Message
+            import json as _json
+
+            services_info = skill._collect_services_info()
+            if not services_info:
+                yield {"type": "error", "content": "未配置任何服务端点"}
+                return
+
+            plan_prompt = skill._build_plan_prompt(state.current_task.description, services_info)
+            plan_response = await self.llm.chat([Message(role="user", content=plan_prompt)])
+            plan = skill._parse_plan(plan_response.content)
+
+            if not plan:
+                yield {"type": "token", "content": plan_response.content}
+                return
+
+            logger.info("多服务执行计划：%s", _json.dumps(plan, ensure_ascii=False))
+
+            # ── 第 2 步：逐个执行服务 ──
+            results = []
+            for i, step in enumerate(plan):
+                if cancel_event and cancel_event.is_set():
+                    yield {"type": "cancelled", "content": "请求已被用户取消"}
+                    return
+
+                service_name = step.get("service", "")
+                args = step.get("args", {})
+                desc = step.get("description", service_name)
+
+                yield {
+                    "type": "tool_call",
+                    "name": service_name,
+                    "args": {"step": f"{i + 1}/{len(plan)}", "description": desc},
+                }
+
+                svc_config = skill._find_service(service_name)
+                if not svc_config:
+                    results.append({"step": desc, "service": service_name, "error": "服务不存在"})
+                    continue
+
+                try:
+                    result = await skill._execute_service(svc_config, args)
+                    logger.info("[executor] 多服务 %s 执行完成（结果长度: %d）", service_name, len(str(result)))
+                    yield {"type": "tool_result", "name": service_name, "result": result}
+                    results.append({
+                        "step": desc,
+                        "service": service_name,
+                        "args": args,
+                        "result": result if len(str(result)) < 2000 else str(result)[:2000],
+                    })
+                except Exception as e:
+                    logger.error("服务 %s 执行失败: %s", service_name, e, exc_info=True)
+                    results.append({"step": desc, "service": service_name, "error": str(e)})
+
+            logger.info("多服务执行完毕，共 %d 步", len(results))
+
+            # ── 第 3 步：LLM 整合结果 ──
+            answer_prompt = skill._build_answer_prompt(state.current_task.description, results)
+            answer_response = await self.llm.chat([Message(role="user", content=answer_prompt)])
+            result = answer_response.content
+
+            state.execution_record.add_tool_result(
+                tool=state.context.get("selected_skill", "multi_service"),
+                result=result,
+                success=True,
+            )
+
+            # 用 LLM 流式生成自然语言回复
+            if self.llm:
+                async for chunk in self._generate_response_with_tool_result_stream(
+                    state.current_task.description,
+                    state.context.get("selected_skill", "multi_service"),
+                    result,
+                    enable_thinking,
+                    cancel_event=cancel_event,
+                ):
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    chunk_type = chunk.get("type")
+                    chunk_content = chunk.get("content", "")
+                    if chunk_type == "reasoning_content":
+                        if enable_thinking is not False:
+                            yield {"type": "reasoning_content", "content": chunk_content}
+                    elif chunk_type == "token":
+                        yield {"type": "token", "content": chunk_content}
+            else:
+                yield {"type": "token", "content": str(result)}
+
+        except Exception as e:
+            logger.error("多服务技能流式执行失败：%s", e, exc_info=True)
+            yield {"type": "error", "content": f"多服务技能执行失败：{str(e)}"}
 
     # ── 子工具选择 ────────────────────────────────────
 
@@ -767,6 +873,16 @@ JSON："""
             skill = self._find_skill(selected_skill_name)
             if skill:
                 logger.info("[executor] 已加载技能：%s (类型: %s)", selected_skill_name, type(skill).__name__)
+
+                # ── 多服务技能流式执行 ──
+                if isinstance(skill, MultiServiceSkill):
+                    logger.info("[executor] 走多服务技能路径")
+                    async for chunk in self._execute_multi_service_stream(
+                        skill, state, enable_thinking=enable_thinking,
+                        cancel_event=cancel_event
+                    ):
+                        yield chunk
+                    return
 
                 # ── 复合技能流式执行 ──
                 if isinstance(skill, CompositeSkill) or (

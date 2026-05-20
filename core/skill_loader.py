@@ -331,6 +331,9 @@ class SkillLoader:
         elif config and config.get("type") == "composite":
             # ── 复合模式：无 tool.py，SKILL.md 中声明了 type: composite ──
             skill = self._create_composite_skill(skill_name, config)
+        elif config and config.get("services"):
+            # ── 多服务模式：无 tool.py，SKILL.md 中声明了 services 列表 ──
+            skill = self._create_multi_service_skill(skill_name, config)
         elif config and config.get("service"):
             # ── 配置模式：无 tool.py，但 SKILL.md 中声明了 service ──
             skill = self._create_service_skill(skill_name, config)
@@ -407,6 +410,10 @@ class SkillLoader:
             config["sub_skills"] = front_matter["sub_skills"]
         if front_matter.get("steps"):
             config["steps"] = front_matter["steps"]
+
+        # 多服务端点配置
+        if front_matter.get("services"):
+            config["services"] = front_matter["services"]
 
         # 提取 HTTP 服务配置（配置模式技能）
         service_type = front_matter.get("service_type", "")
@@ -527,4 +534,15 @@ class SkillLoader:
             return CompositeSkill(config)
         except Exception as e:
             logger.error("实例化复合技能 %s 失败：%s", skill_name, e, exc_info=True)
+            return None
+
+    def _create_multi_service_skill(self, skill_name: str, config: Dict) -> Optional[Any]:
+        """
+        创建多服务端点技能实例（配置模式，无需 tool.py）。
+        """
+        from core.multi_service_skill import MultiServiceSkill
+        try:
+            return MultiServiceSkill(config)
+        except Exception as e:
+            logger.error("实例化多服务技能 %s 失败：%s", skill_name, e, exc_info=True)
             return None
