@@ -30,6 +30,9 @@ class McpSkill(BaseSkill):
         self._endpoint = mcp.get("endpoint", "")
         self._timeout = mcp.get("timeout", 120)
 
+        # 参数配置（可选，来自 SKILL.md inputs，用于默认值/必填校验/描述覆盖）
+        self._inputs: Dict[str, Any] = config.get("inputs", {})
+
         # MCP 工具缓存（首次调用时从服务端获取）
         self._tools_cache: Optional[List[Dict[str, Any]]] = None
 
@@ -60,6 +63,56 @@ class McpSkill(BaseSkill):
             ]
         return []
 
+    # ── 子工具调用 ──────────────────────────────────────
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Any:
+        """通过 MCP 协议调用远程工具，而非查找本地方法"""
+        import httpx
+
+        # 注入 LLM
+        if self._llm is None:
+            if hasattr(context, "get"):
+                self._llm = context.get("_llm")
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            await self._mcp_initialize(client)
+
+            # 如果缓存为空，先获取工具列表
+            if not self._tools_cache:
+                tools = await self._mcp_list_tools(client)
+                self._tools_cache = tools
+
+            tool = next((t for t in self._tools_cache if t["name"] == tool_name), None)
+            if not tool:
+                return {"success": False, "error": f"MCP 工具不存在: {tool_name}"}
+
+            # 合并 MCP inputSchema + SKILL.md inputs
+            merged_schema = self._build_merged_schema(tool.get("inputSchema", {}))
+
+            # 如果参数为空，用 LLM 从上下文提取
+            if not arguments:
+                task = context.get("task", "") if isinstance(context, dict) else ""
+                if self._llm:
+                    arguments = await self._extract_arguments(task, [], merged_schema)
+                else:
+                    arguments = self._fallback_extract(task, merged_schema)
+
+            # 填充默认值
+            arguments = self._fill_defaults(arguments, merged_schema)
+
+            # 校验必填参数
+            missing = self._find_missing_required(arguments, merged_schema)
+            if missing:
+                return self._build_missing_params_question(missing)
+
+            result = await self._mcp_call_tool(client, tool_name, arguments)
+            return self._format_result(result)
+
     # ── 核心执行 ──────────────────────────────────────
 
     async def execute(
@@ -77,6 +130,13 @@ class McpSkill(BaseSkill):
             elif hasattr(context, "extra"):
                 self._llm = context.extra.get("_llm")
 
+        # 优先使用 executor 预提取的参数
+        extracted = {}
+        if hasattr(context, "get"):
+            extracted = context.get("extracted_args", {})
+        elif hasattr(context, "extra"):
+            extracted = context.extra.get("extracted_args", {})
+
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             # 1. 初始化 MCP 连接
             await self._mcp_initialize(client)
@@ -89,7 +149,9 @@ class McpSkill(BaseSkill):
             self._tools_cache = tools
 
             # 3. 选择工具 + 提取参数
-            tool_name, arguments = await self._resolve_tool_call(task, messages, tools)
+            tool_name, arguments = await self._resolve_tool_call(
+                task, messages, tools, pre_extracted=extracted
+            )
 
             # 4. 调用工具
             result = await self._mcp_call_tool(client, tool_name, arguments)
@@ -200,6 +262,7 @@ class McpSkill(BaseSkill):
         task: str,
         messages: List[Dict[str, str]],
         tools: List[Dict[str, Any]],
+        pre_extracted: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         选择要调用的 MCP 工具并提取参数。
@@ -209,15 +272,19 @@ class McpSkill(BaseSkill):
         if len(tools) == 1:
             tool = tools[0]
             tool_name = tool["name"]
-            schema = tool.get("inputSchema", {})
-            arguments = await self._extract_arguments(task, messages, schema)
+            merged_schema = self._build_merged_schema(tool.get("inputSchema", {}))
+            arguments = await self._prepare_arguments(
+                task, messages, merged_schema, pre_extracted
+            )
             return tool_name, arguments
 
         # 多工具场景：先选工具，再提取参数
         tool_name = await self._select_tool(task, tools)
         selected = next((t for t in tools if t["name"] == tool_name), tools[0])
-        schema = selected.get("inputSchema", {})
-        arguments = await self._extract_arguments(task, messages, schema)
+        merged_schema = self._build_merged_schema(selected.get("inputSchema", {}))
+        arguments = await self._prepare_arguments(
+            task, messages, merged_schema, pre_extracted
+        )
         return tool_name, arguments
 
     async def _select_tool(self, task: str, tools: List[Dict[str, Any]]) -> str:
@@ -249,6 +316,112 @@ class McpSkill(BaseSkill):
             logger.warning("LLM 工具选择失败: %s", e)
 
         return tools[0]["name"]
+
+    # ── Schema 合并 + 参数准备 ─────────────────────────
+
+    def _build_merged_schema(self, mcp_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        合并 MCP inputSchema + SKILL.md inputs。
+        SKILL.md 的配置优先：description 覆盖、required 补充、default 新增。
+        """
+        if not self._inputs:
+            return mcp_schema
+
+        merged = json.loads(json.dumps(mcp_schema))  # deep copy
+        mcp_props = merged.get("properties", {})
+        mcp_required = set(merged.get("required", []))
+
+        for param_name, cfg in self._inputs.items():
+            if param_name in mcp_props:
+                # 覆盖已有属性
+                if "description" in cfg:
+                    mcp_props[param_name]["description"] = cfg["description"]
+                if "type" in cfg:
+                    mcp_props[param_name]["type"] = cfg["type"]
+            else:
+                # 补充新参数
+                mcp_props[param_name] = {
+                    "type": cfg.get("type", "string"),
+                    "description": cfg.get("description", param_name),
+                }
+            # default 始终写入（MCP inputSchema 通常没有 default）
+            if "default" in cfg:
+                mcp_props[param_name]["default"] = cfg["default"]
+
+            # required 合并
+            if cfg.get("required", False):
+                mcp_required.add(param_name)
+
+        merged["properties"] = mcp_props
+        if mcp_required:
+            merged["required"] = list(mcp_required)
+
+        return merged
+
+    async def _prepare_arguments(
+        self,
+        task: str,
+        messages: List[Dict[str, str]],
+        merged_schema: Dict[str, Any],
+        pre_extracted: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """完整的参数准备链路：预提取 → LLM提取 → 默认值 → 必填校验"""
+        # 1. 优先使用 executor 预提取的参数
+        arguments = dict(pre_extracted) if pre_extracted else {}
+
+        # 2. 缺少的参数用 LLM 补充提取
+        properties = merged_schema.get("properties", {})
+        missing_keys = [k for k in properties if k not in arguments]
+        if missing_keys and self._llm:
+            try:
+                extracted = await self._extract_with_llm(task, messages, merged_schema)
+                for k, v in extracted.items():
+                    if k not in arguments:
+                        arguments[k] = v
+            except Exception as e:
+                logger.warning("LLM 参数提取失败，回退: %s", e)
+                if not arguments:
+                    arguments = self._fallback_extract(task, merged_schema)
+
+        # 3. 填充默认值
+        arguments = self._fill_defaults(arguments, merged_schema)
+
+        # 4. 校验必填参数
+        missing = self._find_missing_required(arguments, merged_schema)
+        if missing:
+            logger.warning("缺少必填参数: %s", missing)
+            # 不阻塞，交给 call_tool 的返回值处理
+
+        return arguments
+
+    def _fill_defaults(
+        self, arguments: Dict[str, Any], schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """用 SKILL.md inputs 中的 default 值填充缺失参数"""
+        result = dict(arguments)
+        for param_name, prop in schema.get("properties", {}).items():
+            if param_name not in result and "default" in prop:
+                result[param_name] = prop["default"]
+        return result
+
+    def _find_missing_required(
+        self, arguments: Dict[str, Any], schema: Dict[str, Any]
+    ) -> List[str]:
+        """找出缺少的必填参数"""
+        required = schema.get("required", [])
+        return [k for k in required if k not in arguments]
+
+    def _build_missing_params_question(self, missing_keys: List[str]) -> str:
+        """构建参数追问消息"""
+        lines = []
+        for key in missing_keys:
+            cfg = self._inputs.get(key, {})
+            desc = cfg.get("description", key)
+            lines.append(f"- {desc}")
+        params_list = "\n".join(lines)
+        return f"我还需要以下信息才能完成操作，请提供：\n{params_list}"
+
+    # ── 参数提取 ─────────────────────────────────────
 
     async def _extract_arguments(
         self,

@@ -426,6 +426,9 @@ class SkillLoader:
                 "endpoint": front_matter.get("endpoint", ""),
                 "timeout": front_matter.get("timeout", 120),
             }
+            # MCP 技能也支持 inputs 配置（用于默认值、必填校验、描述覆盖）
+            if front_matter.get("inputs"):
+                config["inputs"] = front_matter["inputs"]
 
         return config
 

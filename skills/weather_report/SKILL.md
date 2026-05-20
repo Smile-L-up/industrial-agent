@@ -8,6 +8,11 @@ keywords:
   - 重要天气
   - 天气预警
   - 气象报告
+inputs:
+  query:
+    type: string
+    description: 用户输入，包含具体的城市信息
+    default: 福州市气象报告
 ---
 
 # 重要天气报告生成
