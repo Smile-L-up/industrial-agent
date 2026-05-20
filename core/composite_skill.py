@@ -224,7 +224,12 @@ class CompositeSkill(BaseSkill):
 ## 执行结果
 {results_text}
 
-请直接给出回答，简洁明了。"""
+## 回答要求
+1. 保留所有结果中的 URL 链接（如图片地址、文件链接），不要省略
+2. 如果结果中包含色斑图、图表等可视化内容，请展示其 URL
+3. 如果结果包含报告文本，请完整引用关键内容
+4. 按子技能分别展示结果，结构清晰
+5. 直接给出回答，不需要重复用户的问题"""
 
     def _format_skill_info(self, info: Dict[str, Any]) -> str:
         desc = info.get("description", "")

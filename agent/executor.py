@@ -264,6 +264,8 @@ class Executor:
                 sub_result = await skill._execute_sub_skill(
                     sub_skill, state.current_task.description, state.context, state.messages, args
                 )
+                logger.info("[executor] 子技能 %s 执行完成（结果长度: %d）", skill_name, len(str(sub_result)))
+                yield {"type": "tool_result", "name": skill_name, "result": sub_result}
                 results.append({
                     "step": desc,
                     "skill": skill_name,
