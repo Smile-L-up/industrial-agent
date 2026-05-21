@@ -375,6 +375,61 @@ class SkillLoader:
         """获取技能元数据"""
         return self.metadata_cache.get(skill_name)
 
+    # ==================== 热加载接口 ====================
+
+    def reload_metadata(self) -> List[SkillMetadata]:
+        """
+        清空缓存并重新扫描技能目录。
+        用于技能上传/删除后热加载。
+
+        Returns:
+            更新后的技能元数据列表
+        """
+        self.metadata_cache.clear()
+        self.skill_cache.clear()
+        logger.info("已清空技能缓存，重新扫描...")
+        return self.load_all_metadata()
+
+    def remove_skill(self, skill_name: str) -> bool:
+        """
+        从缓存中移除指定技能（不删除文件）。
+
+        Args:
+            skill_name: 技能名称
+
+        Returns:
+            是否成功移除
+        """
+        removed = False
+        if skill_name in self.metadata_cache:
+            del self.metadata_cache[skill_name]
+            removed = True
+        if skill_name in self.skill_cache:
+            del self.skill_cache[skill_name]
+            removed = True
+        if removed:
+            logger.info("已从缓存中移除技能：%s", skill_name)
+        return removed
+
+    def get_skill_dir(self, skill_name: str) -> Path:
+        """
+        获取技能目录路径。
+
+        Args:
+            skill_name: 技能名称
+
+        Returns:
+            技能目录的 Path 对象
+        """
+        meta = self.metadata_cache.get(skill_name)
+        if meta and meta.path:
+            return Path(meta.path)
+        return self.skills_dir / skill_name
+
+    def get_existing_skill_names(self) -> set:
+        """获取所有已知技能名称集合"""
+        return set(self.metadata_cache.keys())
+
     # ==================== 内部方法 ====================
 
     def _load_config(self, skill_path: Path) -> Optional[Dict]:

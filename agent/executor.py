@@ -167,8 +167,9 @@ class Executor:
             # ── 2. 配置模式技能：用 LLM 提取结构化参数 ──
             skill_inputs = getattr(skill, "_inputs", None)
             if skill_inputs and self.llm:
+                raw = skill._config.get("raw_content", "")
                 extracted = await self._extract_http_params(
-                    state.current_task.description, skill_inputs
+                    state.current_task.description, skill_inputs, skill_context=raw
                 )
                 logger.info("配置模式技能参数提取结果：%s", extracted)
                 if extracted:
@@ -289,12 +290,14 @@ class Executor:
 
             # 用 LLM 流式生成自然语言回复
             if self.llm:
+                raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
                 async for chunk in self._generate_response_with_tool_result_stream(
                     state.current_task.description,
                     state.context.get("selected_skill", "composite"),
                     result,
                     enable_thinking,
                     cancel_event=cancel_event,
+                    skill_context=raw,
                 ):
                     if cancel_event and cancel_event.is_set():
                         return
@@ -394,12 +397,14 @@ class Executor:
 
             # 用 LLM 流式生成自然语言回复
             if self.llm:
+                raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
                 async for chunk in self._generate_response_with_tool_result_stream(
                     state.current_task.description,
                     state.context.get("selected_skill", "multi_service"),
                     result,
                     enable_thinking,
                     cancel_event=cancel_event,
+                    skill_context=raw,
                 ):
                     if cancel_event and cancel_event.is_set():
                         return
@@ -476,7 +481,7 @@ class Executor:
     # ── 配置模式技能：LLM 参数提取 ──────────────────────
 
     async def _extract_http_params(
-        self, task: str, skill_inputs: Dict[str, Any]
+        self, task: str, skill_inputs: Dict[str, Any], skill_context: str = ""
     ) -> Dict[str, Any]:
         """
         使用 LLM 从用户消息中提取结构化参数（JSON）。
@@ -495,10 +500,14 @@ class Executor:
                 param_lines.append(f'  "{name}": "{desc}"')
         params_desc = "\n".join(param_lines)
 
+        context_section = ""
+        if skill_context:
+            context_section = f"\n技能说明：\n{skill_context}\n"
+
         prompt = f"""请从用户消息中提取以下参数，返回 JSON 对象。
 只返回 JSON，不要其他文字。未提及的参数不要包含。
 对于日期类参数如"昨天"，请转换为 YYYY-MM-DD 格式。
-
+{context_section}
 参数说明：
 {params_desc}
 
@@ -708,6 +717,7 @@ JSON："""
         tool_name: str,
         tool_result: Any,
         enable_thinking: Optional[bool] = None,
+        skill_context: str = "",
     ) -> str:
         """使用 LLM 根据工具执行结果生成自然语言回复（非流式）"""
         if not self.llm:
@@ -717,8 +727,12 @@ JSON："""
 
         result_str = self._format_data_for_prompt(tool_result)
 
-        prompt = f"""你是一个智能助手。你已经调用了工具获取了信息，现在需要根据工具返回的数据，用自然语言回答用户的问题。
+        context_section = ""
+        if skill_context:
+            context_section = f"\n技能说明：\n{skill_context}\n"
 
+        prompt = f"""你是一个智能助手。你已经调用了工具获取了信息，现在需要根据工具返回的数据，用自然语言回答用户的问题。
+{context_section}
 用户问题：{user_query}
 调用的工具：{tool_name}
 工具返回的数据：{result_str}
@@ -742,6 +756,7 @@ JSON："""
         tool_result: Any,
         enable_thinking: Optional[bool] = None,
         cancel_event: Optional[asyncio.Event] = None,
+        skill_context: str = "",
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """使用 LLM 根据工具执行结果生成自然语言回复（流式）"""
         if not self.llm:
@@ -752,8 +767,12 @@ JSON："""
 
         result_str = self._format_data_for_prompt(tool_result)
 
-        prompt = f"""你是一个智能助手。你已经调用了工具获取了信息，现在需要根据工具返回的数据，用自然语言回答用户的问题。
+        context_section = ""
+        if skill_context:
+            context_section = f"\n技能说明：\n{skill_context}\n"
 
+        prompt = f"""你是一个智能助手。你已经调用了工具获取了信息，现在需要根据工具返回的数据，用自然语言回答用户的问题。
+{context_section}
 用户问题：{user_query}
 调用的工具：{tool_name}
 工具返回的数据：{result_str}
@@ -933,12 +952,14 @@ JSON："""
                         full_response = ""
                         full_thinking = ""
 
+                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
                         async for chunk in self._generate_response_with_tool_result_stream(
                             state.current_task.description,
                             selected_tool,
                             tool_result_data,
                             enable_thinking,
                             cancel_event=cancel_event,
+                            skill_context=raw,
                         ):
                             # 检查取消信号
                             if cancel_event and cancel_event.is_set():
@@ -972,8 +993,9 @@ JSON："""
                     # 用 LLM 从用户消息中提取结构化参数
                     if self.llm:
                         yield {"type": "status", "content": "正在提取参数......"}
+                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
                         extracted = await self._extract_http_params(
-                            state.current_task.description, skill_inputs
+                            state.current_task.description, skill_inputs, skill_context=raw
                         )
                         if extracted:
                             state.context["extracted_args"] = extracted
@@ -1004,12 +1026,14 @@ JSON："""
 
                     # 流式输出结果
                     if self.llm:
+                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
                         async for chunk in self._generate_response_with_tool_result_stream(
                             state.current_task.description,
                             selected_skill_name,
                             result,
                             enable_thinking,
                             cancel_event=cancel_event,
+                            skill_context=raw,
                         ):
                             # 检查取消信号
                             if cancel_event and cancel_event.is_set():

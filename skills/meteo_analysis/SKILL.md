@@ -1,6 +1,6 @@
 ---
 name: meteo_analysis
-description: "综合气象分析：自动生成气象色斑图、重要天气报告，并从知识库检索参考资料。当用户需要全面的气象分析、综合气象报告、气象数据可视化与分析时使用。"
+description: "综合气象分析：自动编排色斑图、天气报告、知识库检索test"
 type: composite
 sub_skills:
   - weather_map

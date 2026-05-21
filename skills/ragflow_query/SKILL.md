@@ -1,6 +1,6 @@
 ---
 name: ragflow_query
-description: "从 RAGFlow 知识库中检索相关信息，回答用户关于知识库内容的问题。当用户提问需要查阅知识库资料时使用。"
+description: "从 RAGFlow 知识库检索信息，回答知识库相关问题"
 service_type: http
 endpoint: http://192.168.110.201:9383/api/v1/retrieval
 method: POST

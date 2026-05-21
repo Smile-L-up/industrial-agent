@@ -19,7 +19,7 @@ setup_logging()
 
 logger = logging.getLogger("industrial_agent.api")
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -30,6 +30,7 @@ from config import LLM_CONFIG, DATABASE_CONFIG, SESSION_CONFIG
 from llm.llm import get_llm
 from agent.graph import AgentGraph
 from core.skill_loader import SkillLoader
+from core.skill_validator import validate_skill_zip, extract_skill_zip
 from core.streaming import StreamingResponse as StreamResponse
 from core.image_uploader import ImageUploader
 from core.image_store import ImageStore
@@ -414,6 +415,8 @@ async def root():
             "chat_cancel": "/api/chat/cancel",
             "health": "/health",
             "skills": "/api/skills",
+            "skills_reload": "POST /api/skills/reload",
+            "skills_upload": "POST /api/skills/upload",
             "static": "/static/index.html"
         }
     }
@@ -729,6 +732,169 @@ async def list_skills():
             for meta in metadata_list
         ]
     }
+
+
+@app.post("/api/skills/reload")
+async def reload_skills():
+    """
+    手动触发热加载 — 清空缓存并重新扫描 skills/ 目录
+
+    适用场景：
+    - 手动往 skills/ 目录放了新技能文件
+    - 修改了某个 SKILL.md 或 tool.py
+    - 删除了某个技能目录
+    """
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=503, detail="系统正在初始化中")
+
+    skill_loader: SkillLoader = app_state["skill_loader"]
+    old_count = len(app_state["metadata_list"])
+
+    metadata_list = skill_loader.reload_metadata()
+    app_state["metadata_list"] = metadata_list
+
+    new_count = len(metadata_list)
+    skill_names = [m.name for m in metadata_list]
+
+    logger.info("技能热加载完成：%d → %d 个技能", old_count, new_count)
+
+    return {
+        "message": "热加载完成",
+        "before": old_count,
+        "after": new_count,
+        "skills": skill_names,
+    }
+
+
+@app.post("/api/skills/upload")
+async def upload_skill(file: UploadFile = File(...)):
+    """
+    上传技能包（ZIP 文件）
+
+    - 解压后必须包含 SKILL.md（含 name 和 description）
+    - 如有 tool.py，会进行静态安全扫描
+    - 同名技能会拒绝上传（需先删除）
+    - 上传成功后立即热加载生效
+    """
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=503, detail="系统正在初始化中")
+
+    # 读取文件内容
+    try:
+        content = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"读取上传文件失败：{e}")
+
+    # 校验 ZIP 包
+    skill_loader: SkillLoader = app_state["skill_loader"]
+    existing_names = skill_loader.get_existing_skill_names()
+    result = validate_skill_zip(content, existing_skills=existing_names)
+
+    if not result.valid:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "技能包校验失败", "errors": result.errors}
+        )
+
+    # 解压到技能目录
+    target_dir = skill_loader.get_skill_dir(result.skill_name)
+    extract_result = extract_skill_zip(content, target_dir)
+
+    if not extract_result.valid:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "技能解压失败", "errors": extract_result.errors}
+        )
+
+    # 热加载：刷新元数据缓存
+    metadata_list = skill_loader.reload_metadata()
+    app_state["metadata_list"] = metadata_list
+
+    logger.info("技能上传成功：%s (%s)", result.skill_name, result.skill_description)
+
+    return {
+        "message": "技能上传成功",
+        "skill": {
+            "name": result.skill_name,
+            "description": result.skill_description,
+            "files": result.files,
+        },
+        "warnings": result.warnings if result.warnings else None,
+    }
+
+
+@app.get("/api/skills/{skill_name}")
+async def get_skill_detail(skill_name: str):
+    """获取单个技能的详细信息（含 SKILL.md 内容）"""
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=503, detail="系统正在初始化中")
+
+    skill_loader: SkillLoader = app_state["skill_loader"]
+    meta = skill_loader.get_metadata(skill_name)
+
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"技能不存在：{skill_name}")
+
+    # 读取 SKILL.md 内容
+    skill_dir = skill_loader.get_skill_dir(skill_name)
+    skill_md = skill_dir / "SKILL.md"
+    md_content = ""
+    if skill_md.exists():
+        try:
+            md_content = skill_md.read_text(encoding="utf-8")
+        except Exception as e:
+            md_content = f"(读取失败：{e})"
+
+    # 列出文件
+    files = []
+    if skill_dir.exists():
+        for f in skill_dir.rglob("*"):
+            if f.is_file():
+                files.append(str(f.relative_to(skill_dir)))
+
+    return {
+        "name": meta.name,
+        "description": meta.description,
+        "keywords": meta.keywords,
+        "files": files,
+        "skill_md": md_content,
+    }
+
+
+@app.delete("/api/skills/{skill_name}")
+async def delete_skill(skill_name: str):
+    """
+    删除指定技能
+
+    - 删除技能目录及所有文件
+    - 从缓存中移除
+    - 热加载刷新
+    """
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=503, detail="系统正在初始化中")
+
+    skill_loader: SkillLoader = app_state["skill_loader"]
+    meta = skill_loader.get_metadata(skill_name)
+
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"技能不存在：{skill_name}")
+
+    # 删除技能目录
+    skill_dir = skill_loader.get_skill_dir(skill_name)
+    if skill_dir.exists():
+        import shutil
+        try:
+            shutil.rmtree(skill_dir)
+            logger.info("已删除技能目录：%s", skill_dir)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"删除技能目录失败：{e}")
+
+    # 热加载：刷新缓存
+    metadata_list = skill_loader.reload_metadata()
+    app_state["metadata_list"] = metadata_list
+
+    logger.info("技能已删除：%s", skill_name)
+    return {"message": f"技能 '{skill_name}' 已删除", "skill_name": skill_name}
 
 
 @app.post("/api/session/create")
