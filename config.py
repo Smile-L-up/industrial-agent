@@ -4,6 +4,7 @@
 """
 
 import os
+import json
 import logging
 from dotenv import load_dotenv
 
@@ -36,6 +37,16 @@ LLM_CONFIG = {
 4. 避免中英文混杂，除非是专有名词或技术术语
 5. 直接给出答案，不需要过多的解释和说明"""),
 }
+
+# 多模型注册表
+# 从环境变量 LLM_MODELS 读取 JSON，key 为模型名，value 包含 api_key 和 base_url
+# 示例：{"qwen3.5-plus":{"api_key":"sk-xxx","base_url":"https://..."},"qwen-max":{"api_key":"sk-yyy","base_url":"https://..."}}
+_llm_models_raw = os.getenv("LLM_MODELS", "")
+try:
+    LLM_MODELS: dict = json.loads(_llm_models_raw) if _llm_models_raw else {}
+except json.JSONDecodeError:
+    logger.warning("LLM_MODELS 环境变量不是合法 JSON，已忽略：%s", _llm_models_raw[:100])
+    LLM_MODELS = {}
 
 # 记忆系统配置
 MEMORY_CONFIG = {

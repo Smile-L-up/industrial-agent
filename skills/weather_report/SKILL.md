@@ -1,18 +1,24 @@
 ---
 name: weather_report
 description: 生成福建省地市的重要天气报告
-service_type: mcp
-endpoint: http://192.168.110.201:18080/mcp/server/fuH8MDaMuFZhIaWc/mcp
+
+services:
+  - name: report
+    description: "生成福建省地市的重要天气报告"
+    service_type: mcp
+    endpoint: http://192.168.110.201:18080/mcp/server/fuH8MDaMuFZhIaWc/mcp
+    tool_name: "我的重要天气报告生成"
+    inputs:
+      query:
+        type: string
+        description: 用户输入，包含具体的城市信息
+        default: 福州市气象报告
+
 keywords:
   - 天气报告
   - 重要天气
   - 天气预警
   - 气象报告
-inputs:
-  query:
-    type: string
-    description: 用户输入，包含具体的城市信息
-    default: 福州市气象报告
 ---
 
 # 重要天气报告生成

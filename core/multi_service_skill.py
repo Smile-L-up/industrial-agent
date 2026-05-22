@@ -69,7 +69,7 @@ class MultiServiceSkill(BaseSkill):
             return "技能未配置任何服务端点"
 
         # ── 第 1 步：LLM 规划 ──
-        services_info = self._collect_services_info()
+        services_info = await self._collect_services_info()
         plan_prompt = self._build_plan_prompt(task, services_info)
         from llm.llm import Message
         plan_response = await llm.chat([Message(role="user", content=plan_prompt)])
@@ -78,7 +78,16 @@ class MultiServiceSkill(BaseSkill):
         if not plan:
             return plan_response.content
 
+        # 过滤掉不存在的服务名
+        valid_names = {svc.get("name") for svc in self._services}
+        plan = [s for s in plan if s.get("service", "") in valid_names]
         logger.info("多服务执行计划：%s", json.dumps(plan, ensure_ascii=False))
+
+        if not plan:
+            logger.warning("过滤后无有效服务调用，回退到 LLM 直接回答")
+            from llm.llm import Message as _Msg
+            fallback_resp = await llm.chat([_Msg(role="user", content=task)])
+            return fallback_resp.content
 
         # ── 第 2 步：按计划执行各服务 ──
         results: List[Dict[str, Any]] = []
@@ -113,8 +122,8 @@ class MultiServiceSkill(BaseSkill):
 
     # ── 服务信息收集 ──────────────────────────────────
 
-    def _collect_services_info(self) -> List[Dict[str, Any]]:
-        """收集所有服务端点的描述和参数信息"""
+    async def _collect_services_info(self) -> List[Dict[str, Any]]:
+        """收集所有服务端点的描述和参数信息，MCP 服务自动查询参数 schema"""
         info = []
         for svc in self._services:
             entry: Dict[str, Any] = {
@@ -132,8 +141,69 @@ class MultiServiceSkill(BaseSkill):
                     }
                     for k, v in inputs.items()
                 }
+
+            # MCP 服务：自动查询 tools/list 获取参数 schema
+            if svc.get("service_type") == "mcp":
+                try:
+                    tools = await self._query_mcp_tools(svc)
+                    if tools:
+                        entry["mcp_tools"] = tools
+                except Exception as e:
+                    logger.warning("查询 MCP 工具列表失败 (%s): %s", svc.get("name"), e)
+
             info.append(entry)
         return info
+
+    async def _query_mcp_tools(self, svc_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """查询 MCP 服务的 tools/list，返回工具及其参数 schema"""
+        import httpx
+
+        endpoint = svc_config.get("endpoint", "")
+        timeout = svc_config.get("timeout", 30)
+        target_tool = svc_config.get("tool_name", "")
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # MCP initialize
+            await client.post(
+                endpoint,
+                json={
+                    "jsonrpc": "2.0", "method": "initialize", "id": 1,
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "industrial-agent", "version": "1.0.0"},
+                    },
+                },
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            await client.post(
+                endpoint,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+
+            # tools/list
+            resp = await client.post(
+                endpoint,
+                json={"jsonrpc": "2.0", "method": "tools/list", "id": 2, "params": {}},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            all_tools = resp.json().get("result", {}).get("tools", [])
+
+        # 如果指定了 tool_name，只保留匹配的
+        if target_tool:
+            all_tools = [t for t in all_tools if t.get("name") == target_tool]
+
+        # 精简输出：只保留 name, description, inputSchema
+        return [
+            {
+                "name": t.get("name", ""),
+                "description": t.get("description", ""),
+                "parameters": t.get("inputSchema", {}).get("properties", {}),
+                "required": t.get("inputSchema", {}).get("required", []),
+            }
+            for t in all_tools
+        ]
 
     def _find_service(self, name: str) -> Optional[Dict[str, Any]]:
         """按名称查找服务配置"""
@@ -353,8 +423,10 @@ class MultiServiceSkill(BaseSkill):
 [{{"service": "服务名", "args": {{"参数名": "参数值"}}, "description": "步骤说明"}}]
 
 注意：
+- service 字段只能填上述"可用服务"中列出的服务名，禁止使用其他名称
 - 只选择与用户任务相关的服务，不要全部调用
 - args 中的参数值必须是具体的，不能是描述性文字
+- 严格按照"技能详细说明"中的参数填写规则来生成 args
 - 如果需要根据当前日期推算，请直接计算出具体日期
 - 今天是 {date.today().strftime("%Y-%m-%d")}
 - 只输出 JSON 数组，不要输出其他内容"""
@@ -364,8 +436,10 @@ class MultiServiceSkill(BaseSkill):
             f"步骤{i+1} [{r['service']}]: {r.get('result', r.get('error', '无结果'))}"
             for i, r in enumerate(results)
         )
+        raw_content = self._config.get("raw_content", "")
+        context_section = f"\n## 技能说明\n{raw_content}\n" if raw_content else ""
         return f"""根据以下服务的执行结果，回答用户的问题。
-
+{context_section}
 ## 用户问题
 {task}
 
@@ -383,6 +457,7 @@ class MultiServiceSkill(BaseSkill):
         desc = info.get("description", "")
         svc_type = info.get("service_type", "http")
         inputs = info.get("inputs", {})
+        mcp_tools = info.get("mcp_tools", [])
         lines = [f"- **{info['name']}**（{svc_type}）: {desc}"]
         if inputs:
             params = []
@@ -392,6 +467,23 @@ class MultiServiceSkill(BaseSkill):
                 params.append(f"    - {k}: {v['description']}（{req}{default}）")
             lines.append("  参数：")
             lines.extend(params)
+        if mcp_tools:
+            for tool in mcp_tools:
+                tool_name = tool.get("name", "")
+                tool_desc = tool.get("description", "")
+                required = tool.get("required", [])
+                params = tool.get("parameters", {})
+                lines.append(f"  MCP 工具: {tool_name}")
+                if tool_desc:
+                    lines.append(f"  说明: {tool_desc}")
+                if params:
+                    lines.append("  参数：")
+                    for pname, pinfo in params.items():
+                        p_desc = pinfo.get("description", "") if isinstance(pinfo, dict) else str(pinfo)
+                        p_type = pinfo.get("type", "") if isinstance(pinfo, dict) else ""
+                        req = "必填" if pname in required else "可选"
+                        type_str = f"，类型={p_type}" if p_type else ""
+                        lines.append(f"    - {pname}: {p_desc}（{req}{type_str}）")
         return "\n".join(lines)
 
     # ── 响应解析 ─────────────────────────────────────

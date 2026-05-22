@@ -2,13 +2,6 @@
 name: weather_map_recent
 description: "生成最近N天的气象色斑图（用户说'最近三天/近一周/近一个月'等相对时间时使用）"
 type: composite
-keywords:
-  - 最近
-  - 近三天
-  - 近一周
-  - 近一个月
-  - 最近三天
-  - 最近一周
 
 sub_skills:
   - time_query

@@ -25,13 +25,19 @@ class McpSkill(BaseSkill):
         self._description = config.get("description", "MCP 服务技能")
         self._keywords: List[str] = config.get("keywords", [])
 
-        # MCP 服务配置
+        # MCP 服务配置（兼容新旧格式）
+        # 新格式：service 对象中
+        service = config.get("service", {})
+        # 旧格式：mcp 对象中
         mcp = config.get("mcp", {})
-        self._endpoint = mcp.get("endpoint", "")
-        self._timeout = mcp.get("timeout", 120)
+
+        # 优先从 service 获取，回退到 mcp
+        self._endpoint = service.get("endpoint") or mcp.get("endpoint", "")
+        self._timeout = service.get("timeout") or mcp.get("timeout", 120)
+        self._tool_name = service.get("tool_name", "")
 
         # 参数配置（可选，来自 SKILL.md inputs，用于默认值/必填校验/描述覆盖）
-        self._inputs: Dict[str, Any] = config.get("inputs", {})
+        self._inputs: Dict[str, Any] = service.get("inputs") or config.get("inputs", {})
 
         # MCP 工具缓存（首次调用时从服务端获取）
         self._tools_cache: Optional[List[Dict[str, Any]]] = None

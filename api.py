@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 # 导入项目模块
-from config import LLM_CONFIG, DATABASE_CONFIG, SESSION_CONFIG
+from config import LLM_CONFIG, LLM_MODELS, DATABASE_CONFIG, SESSION_CONFIG
 from llm.llm import get_llm
 from agent.graph import AgentGraph
 from core.skill_loader import SkillLoader
@@ -40,7 +40,7 @@ from core.database import init_database, get_database
 # 全局变量存储初始化组件
 app_state = {
     "llm": None,
-    "skills": None,
+    "skill_loader": None,
     "agent_graph": None,
     "db": None,
     "initialized": False
@@ -116,7 +116,6 @@ def get_or_create_session(session_id: Optional[str] = None) -> tuple:
     # 创建 AgentGraph 实例（不保存历史，历史存储在数据库中）
     agent_graph = AgentGraph(
         skill_loader=app_state["skill_loader"],
-        metadata_list=app_state["metadata_list"],
         llm=app_state["llm"],
         max_history=SESSION_CONFIG["max_history"],
         session_id=session_id,
@@ -159,12 +158,10 @@ async def lifespan(app: FastAPI):
         logger.error("      ✗ 语言模型初始化失败：%s", e, exc_info=True)
         app_state["llm"] = None
     
-    # [3/4] 加载技能元数据（轻量，不加载 tool.py）
-    logger.info("[3/4] 扫描技能目录")
+    # [3/4] 初始化技能加载器（不预加载元数据，按需加载）
+    logger.info("[3/4] 初始化技能加载器")
     skill_loader = SkillLoader()
-    metadata_list = skill_loader.load_all_metadata()
     app_state["skill_loader"] = skill_loader
-    app_state["metadata_list"] = metadata_list
     
     # [4/4] 不再创建默认 AgentGraph（每次请求独立创建，避免并发竞态）
     logger.info("[4/4] 跳过默认代理图初始化（按请求创建）")
@@ -232,7 +229,7 @@ class ChatRequest(BaseModel):
     messages: List[Dict[str, Any]] = Field(..., description="OpenAI 标准格式的消息列表，支持多模态内容")
     session_id: Optional[str] = Field(default=None, description="会话 ID，用于多轮对话。首次可不传，后续请求携带返回的 session_id")
     request_id: Optional[str] = Field(default=None, description="请求 ID，用于取消请求。客户端生成唯一 ID，调用 /api/chat/cancel 可取消该请求")
-    model: Optional[str] = Field(default=None, description="指定使用的模型（可选，用于覆盖默认配置）")
+    model: Optional[str] = Field(default=None, description="指定使用的模型（可选，自动从 LLM_MODELS 注册表查找对应的 API Key 和 Base URL）")
     temperature: Optional[float] = Field(default=None, description="温度参数（0-2，越高越随机）")
     max_tokens: Optional[int] = Field(default=None, description="最大生成 token 数")
     top_p: Optional[float] = Field(default=None, description="核采样参数")
@@ -341,7 +338,6 @@ async def generate_stream_chunks_with_messages(
     if custom_llm:
         agent_graph.llm = custom_llm
         agent_graph.executor.llm = custom_llm
-        agent_graph.router.llm = custom_llm
         logger.info("[generate_stream_chunks_with_messages] 已设置 custom_llm, custom_llm.model=%s", custom_llm.model)
     
     try:
@@ -428,7 +424,6 @@ async def health_check():
     return {
         "status": "healthy" if app_state["initialized"] else "initializing",
         "llm": "ready" if app_state["llm"] else "not ready",
-        "skills_count": len(app_state.get("metadata_list") or [])
     }
 
 
@@ -444,9 +439,9 @@ def _create_llm_for_request(
 ):
     """
     为请求创建 LLM 实例
-    
+
     Args:
-        model_name: 用户指定的模型名称（可选）
+        model_name: 用户指定的模型名称（可选，自动从 LLM_MODELS 注册表查找对应 api_key/base_url）
         enable_thinking: 是否启用思考模式（可选）
         temperature: 温度参数（可选）
         max_tokens: 最大 token 数（可选）
@@ -454,14 +449,24 @@ def _create_llm_for_request(
         frequency_penalty: 频率惩罚（可选）
         presence_penalty: 存在惩罚（可选）
         **kwargs: 其他 OpenAI 兼容参数
-        
+
     Returns:
         LLM 实例
     """
     config = LLM_CONFIG.copy()
     if model_name:
-        config["model"] = model_name
-        logger.info("[_create_llm_for_request] 使用用户指定的模型：%s", model_name)
+        # 从 LLM_MODELS 注册表查找对应配置
+        model_cfg = LLM_MODELS.get(model_name)
+        if model_cfg:
+            config["model"] = model_name
+            if model_cfg.get("api_key"):
+                config["api_key"] = model_cfg["api_key"]
+            if model_cfg.get("base_url"):
+                config["base_url"] = model_cfg["base_url"]
+            logger.info("[_create_llm_for_request] 使用注册表模型：%s", model_name)
+        else:
+            config["model"] = model_name
+            logger.info("[_create_llm_for_request] 使用用户指定的模型（注册表无匹配，用默认 key）：%s", model_name)
     else:
         logger.info("[_create_llm_for_request] 使用默认模型：%s", config['model'])
     
@@ -578,11 +583,9 @@ async def chat(request: ChatRequest):
             )
             original_llm = agent_graph.llm
             original_executor_llm = agent_graph.executor.llm
-            original_router_llm = agent_graph.router.llm
             agent_graph.llm = llm
             agent_graph.executor.llm = llm
-            agent_graph.router.llm = llm
-            
+
             try:
                 result = await agent_graph.run_with_messages(
                     processed_messages,
@@ -593,7 +596,6 @@ async def chat(request: ChatRequest):
             finally:
                 agent_graph.llm = original_llm
                 agent_graph.executor.llm = original_executor_llm
-                agent_graph.router.llm = original_router_llm
         else:
             result = await agent_graph.run_with_messages(
                 processed_messages,
@@ -717,11 +719,12 @@ async def cancel_chat(request: CancelRequest):
 
 @app.get("/api/skills")
 async def list_skills():
-    """获取可用技能列表（元数据）"""
+    """获取可用技能列表（元数据）— 动态扫描"""
     if not app_state["initialized"]:
         raise HTTPException(status_code=503, detail="系统正在初始化中")
 
-    metadata_list = app_state["metadata_list"]
+    skill_loader: SkillLoader = app_state["skill_loader"]
+    metadata_list = skill_loader.load_all_metadata()
     return {
         "skills": [
             {
@@ -748,20 +751,15 @@ async def reload_skills():
         raise HTTPException(status_code=503, detail="系统正在初始化中")
 
     skill_loader: SkillLoader = app_state["skill_loader"]
-    old_count = len(app_state["metadata_list"])
-
     metadata_list = skill_loader.reload_metadata()
-    app_state["metadata_list"] = metadata_list
 
-    new_count = len(metadata_list)
     skill_names = [m.name for m in metadata_list]
 
-    logger.info("技能热加载完成：%d → %d 个技能", old_count, new_count)
+    logger.info("技能热加载完成，共 %d 个技能", len(metadata_list))
 
     return {
         "message": "热加载完成",
-        "before": old_count,
-        "after": new_count,
+        "count": len(metadata_list),
         "skills": skill_names,
     }
 
@@ -807,8 +805,7 @@ async def upload_skill(file: UploadFile = File(...)):
         )
 
     # 热加载：刷新元数据缓存
-    metadata_list = skill_loader.reload_metadata()
-    app_state["metadata_list"] = metadata_list
+    skill_loader.reload_metadata()
 
     logger.info("技能上传成功：%s (%s)", result.skill_name, result.skill_description)
 
@@ -890,8 +887,7 @@ async def delete_skill(skill_name: str):
             raise HTTPException(status_code=500, detail=f"删除技能目录失败：{e}")
 
     # 热加载：刷新缓存
-    metadata_list = skill_loader.reload_metadata()
-    app_state["metadata_list"] = metadata_list
+    skill_loader.reload_metadata()
 
     logger.info("技能已删除：%s", skill_name)
     return {"message": f"技能 '{skill_name}' 已删除", "skill_name": skill_name}

@@ -14,6 +14,7 @@ from .state import AgentState
 from core.skill_loader import SkillLoader
 from core.composite_skill import CompositeSkill
 from core.multi_service_skill import MultiServiceSkill
+from core.prompt_skill import PromptSkill
 from core.logger import get_logger
 
 logger = get_logger("agent.executor")
@@ -96,7 +97,8 @@ class Executor:
             if skill:
                 result = await self._execute_skill(skill, state)
             else:
-                result = await self._execute_general(state, enable_thinking=enable_thinking)
+                state.set_error(f"技能 '{selected_skill_name}' 不存在或加载失败")
+                result = f"技能 '{selected_skill_name}' 不存在或加载失败，请检查技能名称是否正确。"
         else:
             result = await self._execute_general(state, enable_thinking=enable_thinking)
 
@@ -255,6 +257,7 @@ class Executor:
                 yield {
                     "type": "tool_call",
                     "name": skill_name,
+                    "service_type": "sub_skill",
                     "args": {"step": f"{i + 1}/{len(plan)}", "description": desc},
                 }
 
@@ -331,7 +334,7 @@ class Executor:
             from llm.llm import Message
             import json as _json
 
-            services_info = skill._collect_services_info()
+            services_info = await skill._collect_services_info()
             if not services_info:
                 yield {"type": "error", "content": "未配置任何服务端点"}
                 return
@@ -340,8 +343,14 @@ class Executor:
             plan_response = await self.llm.chat([Message(role="user", content=plan_prompt)])
             plan = skill._parse_plan(plan_response.content)
 
+            # 过滤掉不存在的服务名
+            valid_names = {svc.get("name") for svc in skill._services}
+            plan = [s for s in plan if s.get("service", "") in valid_names]
+
             if not plan:
-                yield {"type": "token", "content": plan_response.content}
+                logger.warning("过滤后无有效服务调用，回退到 LLM 直接回答")
+                fallback_resp = await self.llm.chat([Message(role="user", content=state.current_task.description)])
+                yield {"type": "token", "content": fallback_resp.content}
                 return
 
             logger.info("多服务执行计划：%s", _json.dumps(plan, ensure_ascii=False))
@@ -360,6 +369,7 @@ class Executor:
                 yield {
                     "type": "tool_call",
                     "name": service_name,
+                    "service_type": "service",
                     "args": {"step": f"{i + 1}/{len(plan)}", "description": desc},
                 }
 
@@ -388,6 +398,15 @@ class Executor:
             answer_prompt = skill._build_answer_prompt(state.current_task.description, results)
             answer_response = await self.llm.chat([Message(role="user", content=answer_prompt)])
             result = answer_response.content
+
+            # 如果整合结果为空或无意义，回退到 LLM 直接回答
+            if not result or result.strip() in ("", "[]", "{}", "null"):
+                logger.warning("多服务整合结果为空，回退到 LLM 直接回答")
+                result = None
+
+            if result is None:
+                fallback_resp = await self.llm.chat([Message(role="user", content=state.current_task.description)])
+                result = fallback_resp.content
 
             state.execution_record.add_tool_result(
                 tool=state.context.get("selected_skill", "multi_service"),
@@ -806,6 +825,58 @@ JSON："""
             logger.error("LLM 流式生成回复失败：%s", e)
             yield {"type": "token", "content": self._format_tool_result(tool_name, tool_result)}
 
+    # ── Prompt 技能流式执行 ──────────────────────────
+
+    async def _execute_prompt_stream(
+        self,
+        skill: PromptSkill,
+        state: AgentState,
+        enable_thinking: Optional[bool] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        流式执行 Prompt 技能：将 SKILL.md 内容作为 prompt，LLM 流式回答。
+        """
+        if not self.llm:
+            yield {"type": "token", "content": f"技能 '{skill.name}' 的提示内容：\n{skill._raw_content}"}
+            return
+
+        # 构建 prompt
+        prompt = f"""你是一个智能助手，请严格按照以下技能说明来回答用户的问题。
+
+## 技能说明
+{skill._raw_content}
+
+## 用户问题
+{state.current_task.description}
+
+请根据上述技能说明，回答用户的问题。"""
+
+        try:
+            from llm.llm import Message
+            async for chunk in self.llm.chat_stream(
+                [Message(role="user", content=prompt)],
+                cancel_event=cancel_event,
+                enable_thinking=enable_thinking,
+            ):
+                if cancel_event and cancel_event.is_set():
+                    return
+                if isinstance(chunk, dict):
+                    chunk_type = chunk.get("type")
+                    chunk_content = chunk.get("content", "")
+                    if chunk_type == "reasoning_content":
+                        if enable_thinking is not False:
+                            yield {"type": "reasoning_content", "content": chunk_content}
+                    elif chunk_type == "content":
+                        yield {"type": "token", "content": chunk_content}
+                else:
+                    yield {"type": "token", "content": chunk}
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error("[PromptSkill] LLM 流式调用失败：%s", e)
+            yield {"type": "token", "content": f"技能执行失败：{str(e)}"}
+
     # ── 数据格式化辅助 ────────────────────────────────
 
     def _format_data_for_prompt(self, data: Any) -> str:
@@ -890,176 +961,236 @@ JSON："""
 
         if selected_skill_name:
             skill = self._find_skill(selected_skill_name)
-            if skill:
-                logger.info("[executor] 已加载技能：%s (类型: %s)", selected_skill_name, type(skill).__name__)
+            if not skill:
+                error_msg = f"技能 '{selected_skill_name}' 不存在或加载失败，请检查技能名称是否正确。"
+                state.set_error(error_msg)
+                yield {"type": "error", "content": error_msg}
+                return
+            logger.info("[executor] 已加载技能：%s (类型: %s)", selected_skill_name, type(skill).__name__)
 
-                # ── 多服务技能流式执行 ──
-                if isinstance(skill, MultiServiceSkill):
-                    logger.info("[executor] 走多服务技能路径")
-                    async for chunk in self._execute_multi_service_stream(
-                        skill, state, enable_thinking=enable_thinking,
-                        cancel_event=cancel_event
-                    ):
-                        yield chunk
-                    return
-
-                # ── 复合技能流式执行 ──
-                if isinstance(skill, CompositeSkill) or (
-                    hasattr(skill, "_steps") and skill._steps
+            # ── 多服务技能流式执行 ──
+            if isinstance(skill, MultiServiceSkill):
+                logger.info("[executor] 走多服务技能路径")
+                async for chunk in self._execute_multi_service_stream(
+                    skill, state, enable_thinking=enable_thinking,
+                    cancel_event=cancel_event
                 ):
-                    logger.info("[executor] 走复合技能路径")
-                    async for chunk in self._execute_composite_stream(
-                        skill, state, enable_thinking=enable_thinking,
-                        cancel_event=cancel_event
-                    ):
-                        yield chunk
-                    return
+                    yield chunk
+                return
 
-                # ── 子工具流式路径 ──
-                tools: List[Dict] = []
-                if hasattr(skill, "get_tools") and callable(skill.get_tools):
-                    tools = skill.get_tools()
+            # ── 复合技能流式执行 ──
+            if isinstance(skill, CompositeSkill) or (
+                hasattr(skill, "_steps") and skill._steps
+            ):
+                logger.info("[executor] 走复合技能路径")
+                async for chunk in self._execute_composite_stream(
+                    skill, state, enable_thinking=enable_thinking,
+                    cancel_event=cancel_event
+                ):
+                    yield chunk
+                return
 
-                if tools:
-                    logger.info("[executor] 走子工具路径，工具数: %d", len(tools))
-                    selected_tool = self._simple_tool_match(
-                        state.current_task.description, tools
-                    )
-                    if selected_tool:
-                        state.context["current_subtool"] = selected_tool
+            # ── 子工具流式路径 ──
+            tools: List[Dict] = []
+            if hasattr(skill, "get_tools") and callable(skill.get_tools):
+                tools = skill.get_tools()
 
-                        # 使用通用参数提取
-                        arguments = self._extract_tool_arguments(skill, selected_tool, state.current_task.description)
-                        from core.base_skill import BaseSkill
-                        if isinstance(skill, BaseSkill):
-                            tool_result_data = await skill.call_tool(
-                                tool_name=selected_tool,
-                                arguments=arguments,
-                                context=state.context.to_dict(),
-                            )
-                        else:
-                            tool_result_data = await self._get_tool_result(skill, selected_tool, None)
+            if tools:
+                logger.info("[executor] 走子工具路径，工具数: %d", len(tools))
+                selected_tool = self._simple_tool_match(
+                    state.current_task.description, tools
+                )
+                if selected_tool:
+                    state.context["current_subtool"] = selected_tool
 
-                        state.execution_record.add_tool_result(
-                            tool=selected_skill_name,
-                            result=tool_result_data,
-                            success=True,
+                    # 确定 service_type：优先使用技能的 service_type，否则为 tool
+                    skill_service_type = "tool"
+                    if hasattr(skill, "_service_type"):
+                        skill_service_type = skill._service_type
+                    elif hasattr(skill, "_config"):
+                        svc = skill._config.get("service", {})
+                        skill_service_type = svc.get("service_type") or svc.get("type", "tool")
+
+                    # 发出 tool_call 事件
+                    yield {
+                        "type": "tool_call",
+                        "name": selected_tool,
+                        "service_type": skill_service_type,
+                        "args": {"task": state.current_task.description},
+                    }
+
+                    # 使用通用参数提取
+                    arguments = self._extract_tool_arguments(skill, selected_tool, state.current_task.description)
+                    from core.base_skill import BaseSkill
+                    if isinstance(skill, BaseSkill):
+                        tool_result_data = await skill.call_tool(
+                            tool_name=selected_tool,
+                            arguments=arguments,
+                            context=state.context.to_dict(),
                         )
-
-                        yield {"type": "tool_result", "name": selected_tool, "result": tool_result_data}
-
-                        # LLM 流式生成自然语言回复
-                        full_response = ""
-                        full_thinking = ""
-
-                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
-                        async for chunk in self._generate_response_with_tool_result_stream(
-                            state.current_task.description,
-                            selected_tool,
-                            tool_result_data,
-                            enable_thinking,
-                            cancel_event=cancel_event,
-                            skill_context=raw,
-                        ):
-                            # 检查取消信号
-                            if cancel_event and cancel_event.is_set():
-                                logger.info("子工具执行阶段检测到取消信号")
-                                return
-
-                            chunk_type = chunk.get("type")
-                            chunk_content = chunk.get("content", "")
-
-                            if chunk_type == "reasoning_content":
-                                if enable_thinking is not False:
-                                    full_thinking += chunk_content
-                                    yield {"type": "reasoning_content", "content": chunk_content}
-                            elif chunk_type == "token":
-                                full_response += chunk_content
-                                yield {"type": "token", "content": chunk_content}
-
-                        if full_thinking:
-                            state.context["thinking_content"] = full_thinking
-
-                        state.add_message("assistant", full_response)
-                        return
-
-                # ── 配置模式技能（如 HttpSkill）：LLM 提取参数 + 调用服务 ──
-                skill_inputs = getattr(skill, "_inputs", None)
-                if skill_inputs:
-                    logger.info("[executor] 走配置模式路径，inputs: %s", list(skill_inputs.keys()))
-                    if self.llm:
-                        state.context["_llm"] = self.llm
-
-                    # 用 LLM 从用户消息中提取结构化参数
-                    if self.llm:
-                        yield {"type": "status", "content": "正在提取参数......"}
-                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
-                        extracted = await self._extract_http_params(
-                            state.current_task.description, skill_inputs, skill_context=raw
-                        )
-                        if extracted:
-                            state.context["extracted_args"] = extracted
-                            logger.info("LLM 参数提取结果：%s", extracted)
-                        else:
-                            logger.warning("LLM 参数提取返回空")
-
-                    # 执行技能（HTTP 调用）
-                    yield {"type": "status", "content": f"正在调用 {selected_skill_name} 服务......"}
-                    try:
-                        result = await skill.execute(
-                            task=state.current_task.description,
-                            context=state.context,
-                            messages=state.messages,
-                        )
-                    except Exception as e:
-                        logger.error("配置模式技能执行失败：%s", e, exc_info=True)
-                        result = f"服务调用失败：{str(e)}"
+                    else:
+                        tool_result_data = await self._get_tool_result(skill, selected_tool, None)
 
                     state.execution_record.add_tool_result(
                         tool=selected_skill_name,
-                        result=result,
+                        result=tool_result_data,
                         success=True,
                     )
 
-                    logger.info("[executor] 技能执行完成：%s（结果长度: %d）", selected_skill_name, len(str(result)))
-                    yield {"type": "tool_result", "name": selected_skill_name, "result": result}
+                    yield {"type": "tool_result", "name": selected_tool, "result": tool_result_data}
 
-                    # 流式输出结果
-                    if self.llm:
-                        raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
-                        async for chunk in self._generate_response_with_tool_result_stream(
-                            state.current_task.description,
-                            selected_skill_name,
-                            result,
-                            enable_thinking,
-                            cancel_event=cancel_event,
-                            skill_context=raw,
-                        ):
-                            # 检查取消信号
-                            if cancel_event and cancel_event.is_set():
-                                logger.info("配置模式技能执行阶段检测到取消信号")
-                                return
-                            chunk_type = chunk.get("type")
-                            chunk_content = chunk.get("content", "")
-                            if chunk_type == "reasoning_content":
-                                if enable_thinking is not False:
-                                    yield {"type": "reasoning_content", "content": chunk_content}
-                            elif chunk_type == "token":
-                                yield {"type": "token", "content": chunk_content}
-                    else:
-                        yield {"type": "token", "content": str(result)}
+                    # LLM 流式生成自然语言回复
+                    full_response = ""
+                    full_thinking = ""
 
+                    raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
+                    async for chunk in self._generate_response_with_tool_result_stream(
+                        state.current_task.description,
+                        selected_tool,
+                        tool_result_data,
+                        enable_thinking,
+                        cancel_event=cancel_event,
+                        skill_context=raw,
+                    ):
+                        # 检查取消信号
+                        if cancel_event and cancel_event.is_set():
+                            logger.info("子工具执行阶段检测到取消信号")
+                            return
+
+                        chunk_type = chunk.get("type")
+                        chunk_content = chunk.get("content", "")
+
+                        if chunk_type == "reasoning_content":
+                            if enable_thinking is not False:
+                                full_thinking += chunk_content
+                                yield {"type": "reasoning_content", "content": chunk_content}
+                        elif chunk_type == "token":
+                            full_response += chunk_content
+                            yield {"type": "token", "content": chunk_content}
+
+                    if full_thinking:
+                        state.context["thinking_content"] = full_thinking
+
+                    state.add_message("assistant", full_response)
                     return
 
-                # ── 技能流式执行 ──
-                if hasattr(skill, "execute_stream"):
-                    async for chunk in skill.execute_stream(
+            # ── 配置模式技能（如 HttpSkill）：LLM 提取参数 + 调用服务 ──
+            skill_inputs = getattr(skill, "_inputs", None)
+            if skill_inputs:
+                logger.info("[executor] 走配置模式路径，inputs: %s", list(skill_inputs.keys()))
+                if self.llm:
+                    state.context["_llm"] = self.llm
+
+                # 发出 tool_call 事件
+                yield {
+                    "type": "tool_call",
+                    "name": selected_skill_name,
+                    "service_type": "http",
+                    "args": {"task": state.current_task.description, "inputs": list(skill_inputs.keys())},
+                }
+
+                # 用 LLM 从用户消息中提取结构化参数
+                if self.llm:
+                    yield {"type": "status", "content": "正在提取参数......"}
+                    raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
+                    extracted = await self._extract_http_params(
+                        state.current_task.description, skill_inputs, skill_context=raw
+                    )
+                    if extracted:
+                        state.context["extracted_args"] = extracted
+                        logger.info("LLM 参数提取结果：%s", extracted)
+                    else:
+                        logger.warning("LLM 参数提取返回空")
+
+                # 执行技能（HTTP 调用）
+                yield {"type": "status", "content": f"正在调用 {selected_skill_name} 服务......"}
+                try:
+                    result = await skill.execute(
                         task=state.current_task.description,
                         context=state.context,
                         messages=state.messages,
+                    )
+                except Exception as e:
+                    logger.error("配置模式技能执行失败：%s", e, exc_info=True)
+                    result = f"服务调用失败：{str(e)}"
+
+                state.execution_record.add_tool_result(
+                    tool=selected_skill_name,
+                    result=result,
+                    success=True,
+                )
+
+                logger.info("[executor] 技能执行完成：%s（结果长度: %d）", selected_skill_name, len(str(result)))
+                yield {"type": "tool_result", "name": selected_skill_name, "result": result}
+
+                # 流式输出结果
+                if self.llm:
+                    raw = skill._config.get("raw_content", "") if hasattr(skill, "_config") else ""
+                    async for chunk in self._generate_response_with_tool_result_stream(
+                        state.current_task.description,
+                        selected_skill_name,
+                        result,
+                        enable_thinking,
+                        cancel_event=cancel_event,
+                        skill_context=raw,
                     ):
-                        yield {"type": "token", "content": chunk}
-                    return
+                        # 检查取消信号
+                        if cancel_event and cancel_event.is_set():
+                            logger.info("配置模式技能执行阶段检测到取消信号")
+                            return
+                        chunk_type = chunk.get("type")
+                        chunk_content = chunk.get("content", "")
+                        if chunk_type == "reasoning_content":
+                            if enable_thinking is not False:
+                                yield {"type": "reasoning_content", "content": chunk_content}
+                        elif chunk_type == "token":
+                            yield {"type": "token", "content": chunk_content}
+                else:
+                    yield {"type": "token", "content": str(result)}
+
+                return
+
+            # ── Prompt 技能流式执行 ──
+            if isinstance(skill, PromptSkill):
+                logger.info("[executor] 走 Prompt 技能路径")
+
+                # 发出 tool_call 事件
+                yield {
+                    "type": "tool_call",
+                    "name": selected_skill_name,
+                    "service_type": "prompt",
+                    "args": {"task": state.current_task.description},
+                }
+
+                # 注入 LLM
+                if self.llm:
+                    state.context["_llm"] = self.llm
+
+                # 流式执行
+                full_response = ""
+                async for chunk in self._execute_prompt_stream(
+                    skill, state, enable_thinking, cancel_event
+                ):
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    chunk_type = chunk.get("type")
+                    chunk_content = chunk.get("content", "")
+                    if chunk_type == "token":
+                        full_response += chunk_content
+                        yield chunk
+
+                state.add_message("assistant", full_response)
+                return
+
+            # ── 技能流式执行 ──
+            if hasattr(skill, "execute_stream"):
+                async for chunk in skill.execute_stream(
+                    task=state.current_task.description,
+                    context=state.context,
+                    messages=state.messages,
+                ):
+                    yield {"type": "token", "content": chunk}
+                return
 
         # ── 通用 LLM 流式回答 ──
         if self.llm is None:

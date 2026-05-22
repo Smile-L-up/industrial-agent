@@ -1,28 +1,50 @@
-# Industrial Agent Docker Compose
-# 智能体项目 Docker Compose 配置
+# Industrial Agent Intranet Docker Compose
+# 智能体项目内网部署 Docker Compose 配置（使用外部 MySQL 服务）
+# 注意：所有配置直接在此文件中修改，无需修改.env 文件
 
 version: '3.8'
 
 services:
   # 智能体 API 服务
   industrial-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: industrial-agent:0522  # 使用已构建的镜像
     container_name: industrial-agent
     ports:
-      - "18000:18000"
+      - "18001:18000"
     environment:
-      # LLM API 密钥配置
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-sk-da3613b86fe84367926bcda009297dac}
-      # 其他环境变量
-      - PYTHONUNBUFFERED=1
+      # ==================== LLM 配置 ====================
+      - DASHSCOPE_API_KEY=sk-3bf845b4b35e4a5887fcc3099fc75e16
+      - LLM_PROVIDER=openai
+      - LLM_MODEL=qwen3.5-plus
+      - LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      # 多模型注册表：JSON 格式，key 为模型名，value 含 api_key 和 base_url
+      - LLM_MODELS={"qwen3.5-plus":{"api_key":"sk-3bf845b4b35e4a5887fcc3099fc75e16","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1"}}
+      
+      # ==================== 数据库配置 ====================
+      - DB_TYPE=mysql
+      - SQLITE_PATH=data/agent.db
+      - MYSQL_HOST=192.168.110.200
+      - MYSQL_PORT=33306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=Huayun@2024ZB
+      - MYSQL_DATABASE=ai_base
+      
+      # ==================== 会话配置 ====================
+      - SESSION_MAX_HISTORY=10
+      - SESSION_TTL_MINUTES=30
+      - SESSION_MAX_SESSIONS=100
+      
+      # ==================== 代理配置 ====================
+      - AGENT_MAX_ITERATIONS=10
+      
+      # ==================== 系统配置 ====================
       - TZ=Asia/Shanghai
+      - LOG_LEVEL=INFO
+      - PYTHONUNBUFFERED=1
     volumes:
-      # 挂载缓存目录（可选，用于持久化模型缓存）
-      - hf-cache:/root/.cache/huggingface
-      # 挂载日志目录（可选）
-      - ./logs:/app/logs
+      # 挂载配置目录（用于热更新配置）
+      # - ./config.py:/app/config.py
+      - ./skills:/app/skills  # 挂载技能目录，方便开发调试
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:18000/health"]
@@ -32,26 +54,6 @@ services:
       start_period: 60s
     networks:
       - industrial-network
-
-  # Nginx 反向代理（可选，用于生产环境）
-  # nginx:
-  #   image: nginx:alpine
-  #   container_name: industrial-agent-nginx
-  #   ports:
-  #     - "80:80"
-  #   volumes:
-  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
-  #   depends_on:
-  #     - industrial-agent
-  #   restart: unless-stopped
-  #   networks:
-  #     - industrial-network
-
-# 数据卷
-volumes:
-  hf-cache:
-    driver: local
-    name: industrial-agent-hf-cache
 
 # 网络
 networks:

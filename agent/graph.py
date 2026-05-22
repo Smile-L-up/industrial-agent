@@ -2,9 +2,10 @@
 Agent Graph - 代理图状态机
 定义代理的工作流程和状态转换
 
-重构说明：
-  - 使用 SkillMetadata + SkillLoader 替代完整技能列表
-  - 路由阶段只传元数据，执行阶段按需加载
+简化说明：
+  - 移除 Router，不做自动路由
+  - 用户指定技能 → 按需加载并执行
+  - 用户未指定技能 → LLM 直接回答
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import uuid
 from typing import Dict, Any, Optional, AsyncGenerator, List
 from .state import AgentState, Task
 from core.image_store import ImageStore
-from core.skill_loader import SkillLoader, SkillMetadata
+from core.skill_loader import SkillLoader
 from core.streaming import StreamHandler, EventType
 
 logger = logging.getLogger("industrial_agent.graph")
@@ -26,7 +27,6 @@ class AgentGraph:
         self,
         memory=None,
         skill_loader: SkillLoader = None,
-        metadata_list: List[SkillMetadata] = None,
         llm=None,
         max_history: int = 10,
         session_id: Optional[str] = None,
@@ -38,7 +38,6 @@ class AgentGraph:
         Args:
             memory: 记忆系统（暂未使用）
             skill_loader: 技能加载器（用于按需加载技能）
-            metadata_list: 技能元数据列表（轻量，用于路由）
             llm: 语言模型实例
             max_history: 最大对话历史条数
             session_id: 会话 ID（用于数据库存储）
@@ -46,7 +45,6 @@ class AgentGraph:
         """
         self.memory = memory
         self.skill_loader = skill_loader
-        self.metadata_list = metadata_list or []
         self.llm = llm
         self.max_history = max_history
         self.session_id = session_id
@@ -57,10 +55,8 @@ class AgentGraph:
         if db and session_id:
             self.conversation_history = self._load_history_from_db()
 
-        from .router import Router
         from .executor import Executor
 
-        self.router = Router(llm, self.metadata_list)
         self.executor = Executor(llm, self.skill_loader)
 
     # ==================== 历史管理 ====================
@@ -193,26 +189,6 @@ class AgentGraph:
 
         return state, user_input, handler
 
-    async def _route_and_execute(self, state: AgentState, enable_thinking: Optional[bool] = None):
-        """执行路由和技能调度"""
-        state.add_task(Task(
-            id=str(uuid.uuid4()),
-            description=state.user_input
-        ))
-        state = await self.router.route(state)
-
-        # 无匹配技能 → 直接用 LLM 回答
-        if not state.current_tool:
-            response = await self.executor._execute_general(state, enable_thinking=enable_thinking)
-            state.is_complete = True
-            state.final_result = response
-            return state
-
-        state = await self.executor.execute(state, enable_thinking=enable_thinking)
-        state.is_complete = True
-        state.final_result = state.messages[-1]["content"] if state.messages else ""
-        return state
-
     async def run_with_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -222,11 +198,56 @@ class AgentGraph:
     ) -> Dict[str, Any]:
         """
         运行代理流程 - 使用 OpenAI 标准 messages 格式（支持多模态）
+
+        简化逻辑：
+          - 有 selected_skills → 按需加载技能并执行
+          - 无 selected_skills → LLM 直接回答
         """
         state, user_input, handler = await self._prepare_state(messages, selected_skills=selected_skills)
 
-        # 路由 + 执行
-        state = await self._route_and_execute(state, enable_thinking=enable_thinking)
+        # 添加任务
+        task = Task(
+            id=str(uuid.uuid4()),
+            description=user_input
+        )
+        state.add_task(task)
+        state.current_task = task
+
+        # ── 有指定技能 → 按需加载并执行 ──
+        if selected_skills:
+            skill_name = selected_skills[0]
+            state.context["selected_skill"] = skill_name
+            state.current_tool = skill_name
+
+            logger.info("[graph] 用户指定技能：%s，开始执行", skill_name)
+            state = await self.executor.execute(state, enable_thinking=enable_thinking)
+            state.is_complete = True
+            state.final_result = state.messages[-1]["content"] if state.messages else ""
+
+        # ── 无指定技能 → LLM 直接回答 ──
+        else:
+            logger.info("[graph] 未指定技能，LLM 直接回答")
+
+            if not self.llm:
+                state.add_message("assistant", "抱歉，我暂时无法处理这个问题。")
+                state.final_result = "抱歉，我暂时无法处理这个问题。"
+                state.is_complete = True
+            else:
+                from llm.llm import Message
+
+                llm_messages = [
+                    Message(role=msg.get("role", "user"), content=msg.get("content", ""))
+                    for msg in state.messages
+                ]
+
+                response = await self.llm.chat(llm_messages, enable_thinking=enable_thinking)
+
+                if response.thinking_content:
+                    state.context["thinking_content"] = response.thinking_content
+
+                state.add_message("assistant", response.content)
+                state.final_result = response.content
+                state.is_complete = True
 
         # 保存消息到数据库
         self._save_user_messages_to_db(storage_messages, messages)
@@ -243,14 +264,11 @@ class AgentGraph:
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        运行代理流程（流式版本）- 使用 OpenAI 标准 messages 格式（支持多模态）
+        运行代理流程（流式版本）
 
-        Args:
-            messages: 消息列表
-            enable_thinking: 是否启用思考模式
-            storage_messages: 存储用消息列表
-            selected_skills: 用户指定的技能列表
-            cancel_event: 取消信号事件
+        简化逻辑：
+          - 有 selected_skills → 按需加载技能并执行
+          - 无 selected_skills → LLM 直接回答
         """
         state, user_input, handler = await self._prepare_state(messages, selected_skills=selected_skills)
 
@@ -262,155 +280,138 @@ class AgentGraph:
         state.add_task(task)
         state.current_task = task
 
-        # ── 用户指定技能：跳过 LLM 路由 ──
-        user_selected_skills = state.context.get("selected_skills")
-        if user_selected_skills:
-            selected = self.router._match_user_skills(user_selected_skills)
-            if selected:
-                logger.info("使用用户指定的技能：%s", selected)
-                state.context["selected_skill"] = selected
-                state.current_tool = selected
-            else:
-                logger.warning("用户指定的技能均无效：%s", user_selected_skills)
+        # ── 有指定技能 → 按需加载并执行 ──
+        if selected_skills:
+            skill_name = selected_skills[0]
+            state.context["selected_skill"] = skill_name
+            state.current_tool = skill_name
 
-        # ── 流式合并路由：路由 + 无匹配时直接回答 ──
-        if not state.current_tool:
+            logger.info("[graph] 用户指定技能：%s，开始执行", skill_name)
+
+            # 发送技能调用提示消息
+            yield {
+                "type": "skill_invoked",
+                "content": f"正在调用技能: {skill_name}",
+                "skill_name": skill_name,
+            }
+
             full_response = ""
-            async for chunk in self.router.route_stream(
-                user_input, state.messages, enable_thinking=enable_thinking,
-                cancel_event=cancel_event
-            ):
+            full_thinking = ""
+
+            async for chunk in self.executor.execute_stream(state, enable_thinking=enable_thinking, cancel_event=cancel_event):
                 # 检查取消信号
                 if cancel_event and cancel_event.is_set():
-                    logger.info("Agent 流程检测到取消信号（路由阶段）")
+                    logger.info("Agent 流程检测到取消信号（执行阶段）")
                     yield {"type": "cancelled", "content": "请求已被用户取消"}
                     return
 
-                if chunk["type"] == "skill_match":
-                    skill = chunk["skill"]
-                    state.context["selected_skill"] = skill
-                    state.current_tool = skill
-                    logger.info("流式路由匹配到技能：%s", skill)
-                    break
-                elif chunk["type"] == "token":
+                chunk_type = chunk.get("type")
+                if chunk_type == "reasoning_content":
+                    full_thinking += chunk["content"]
+                    if enable_thinking is not False:
+                        yield {"type": "reasoning_content", "content": chunk["content"]}
+                elif chunk_type == "token":
                     full_response += chunk["content"]
+                    yield {"type": "token", "content": chunk["content"]}
+                elif chunk_type == "tool_call":
+                    logger.info("[graph] 子工具调用：%s", chunk.get("name"))
                     yield chunk
-                elif chunk["type"] == "reasoning_content":
+                elif chunk_type == "tool_result":
+                    sub_tool = state.context.get("current_subtool")
+                    logger.info("[graph] 工具结果返回：%s → %s（结果长度: %d）",
+                                state.current_tool, sub_tool, len(str(chunk.get("result", ""))))
+                    await handler.emit(EventType.TOOL_RESULT, {
+                        "tool": state.current_tool,
+                        "sub_tool": sub_tool,
+                        "result": chunk.get("result")
+                    })
                     yield chunk
+                elif chunk_type == "status":
+                    logger.info("[graph] 状态：%s", chunk.get("content"))
+                    yield chunk
+                elif chunk_type == "error":
+                    logger.error("[graph] 错误：%s", chunk.get("content"))
+                    yield chunk
+                elif chunk_type == "cancelled":
+                    yield chunk
+                    return
 
-            # 无匹配技能 → 回答已通过上面的 token 流式输出
-            if not state.current_tool:
-                state.add_message("assistant", full_response)
-                state.final_result = full_response
-                state.is_complete = True
-                self._save_user_messages_to_db(storage_messages, messages)
-                self._save_assistant_response_to_db(state)
-                await handler.emit(EventType.COMPLETE, state.to_dict())
-                yield {"type": "complete", "content": full_response}
-                return
-
-        # ── 有匹配技能 → executor 执行 ──
-        logger.info("[graph] 开始执行技能：%s", state.current_tool)
-        yield {"type": "tool_call", "name": state.current_tool, "args": {}}
-
-        full_response = ""
-        full_thinking = ""
-
-        async for chunk in self.executor.execute_stream(state, enable_thinking=enable_thinking, cancel_event=cancel_event):
-            # 检查取消信号
-            if cancel_event and cancel_event.is_set():
-                logger.info("Agent 流程检测到取消信号（执行阶段）")
-                yield {"type": "cancelled", "content": "请求已被用户取消"}
-                return
-
-            chunk_type = chunk.get("type")
-            if chunk_type == "reasoning_content":
-                full_thinking += chunk["content"]
-                if enable_thinking is not False:
-                    yield {"type": "reasoning_content", "content": chunk["content"]}
-            elif chunk_type == "token":
-                full_response += chunk["content"]
-                yield {"type": "token", "content": chunk["content"]}
-            elif chunk_type == "tool_call":
-                logger.info("[graph] 子工具调用：%s", chunk.get("name"))
-                yield chunk
-            elif chunk_type == "tool_result":
+            # 获取工具执行结果并显示最终状态
+            tool_result = state.tool_results[-1] if state.tool_results else None
+            if tool_result and tool_result.get("success", True):
                 sub_tool = state.context.get("current_subtool")
-                logger.info("[graph] 工具结果返回：%s → %s（结果长度: %d）",
-                            state.current_tool, sub_tool, len(str(chunk.get("result", ""))))
-                await handler.emit(EventType.TOOL_RESULT, {
-                    "tool": state.current_tool,
-                    "sub_tool": sub_tool,
-                    "result": chunk.get("result")
-                })
-                yield chunk
-            elif chunk_type == "status":
-                logger.info("[graph] 状态：%s", chunk.get("content"))
-                yield chunk
-            elif chunk_type == "error":
-                logger.error("[graph] 错误：%s", chunk.get("content"))
-                yield chunk
-            elif chunk_type == "cancelled":
-                yield chunk
-                return
+                if sub_tool:
+                    logger.info("工具执行完成：%s → %s", state.current_tool, sub_tool)
+                else:
+                    logger.info("工具执行完成：%s", state.current_tool)
 
-        # 获取工具执行结果并显示最终状态
-        tool_result = state.tool_results[-1] if state.tool_results else None
-        if tool_result and tool_result.get("success", True):
-            sub_tool = state.context.get("current_subtool")
-            if sub_tool:
-                logger.info("工具执行完成：%s → %s", state.current_tool, sub_tool)
+            state.is_complete = True
+
+            # 保存消息到数据库
+            self._save_user_messages_to_db(storage_messages, messages)
+            self._save_assistant_response_to_db(state)
+
+            # 设置最终结果
+            state.final_result = full_response
+            if not state.final_result and state.messages:
+                for msg in reversed(state.messages):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        state.final_result = msg.get("content", "")
+                        break
+            if not state.final_result:
+                state.final_result = ""
+
+            final_result = state.to_dict()
+            await handler.emit(EventType.COMPLETE, final_result)
+
+            if state.final_result:
+                yield {"type": "complete", "content": state.final_result}
             else:
-                logger.info("工具执行完成：%s", state.current_tool)
+                yield {"type": "complete", "content": ""}
+            return
 
-        state.is_complete = True
+        # ── 无指定技能 → LLM 直接流式回答 ──
+        logger.info("[graph] 未指定技能，LLM 直接回答")
 
-        # 保存消息到数据库
-        self._save_user_messages_to_db(storage_messages, messages)
-        self._save_assistant_response_to_db(state)
-
-        # 设置最终结果
-        state.final_result = full_response
-        if not state.final_result and state.messages:
-            for msg in reversed(state.messages):
-                if msg.get("role") == "assistant" and msg.get("content"):
-                    state.final_result = msg.get("content", "")
-                    break
-        if not state.final_result:
-            state.final_result = ""
-
-        final_result = state.to_dict()
-        await handler.emit(EventType.COMPLETE, final_result)
-
-        if state.final_result:
-            yield {"type": "complete", "content": state.final_result}
-        else:
-            yield {"type": "complete", "content": ""}
-
-    # ── 无匹配技能时 LLM 直接流式回答 ─────────────────
-
-    async def _stream_direct_response(
-        self, state: AgentState, enable_thinking: Optional[bool] = None
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """当没有匹配到技能时，用 LLM 流式直接回答"""
         if not self.llm:
             yield {"type": "token", "content": "抱歉，我暂时无法处理这个问题。"}
+            yield {"type": "complete", "content": "抱歉，我暂时无法处理这个问题。"}
             return
 
         from llm.llm import Message
 
-        # 构建消息列表（带历史）
-        messages = [
+        llm_messages = [
             Message(role=msg.get("role", "user"), content=msg.get("content", ""))
             for msg in state.messages
         ]
 
-        async for chunk in self.llm.chat_stream(messages, enable_thinking=enable_thinking):
+        full_response = ""
+        full_thinking = ""
+
+        async for chunk in self.llm.chat_stream(llm_messages, enable_thinking=enable_thinking, cancel_event=cancel_event):
+            if cancel_event and cancel_event.is_set():
+                yield {"type": "cancelled", "content": "请求已被用户取消"}
+                return
+
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
                 if chunk_type == "reasoning_content":
-                    yield {"type": "reasoning_content", "content": chunk["content"]}
+                    full_thinking += chunk["content"]
+                    if enable_thinking is not False:
+                        yield {"type": "reasoning_content", "content": chunk["content"]}
                 elif chunk_type == "content":
+                    full_response += chunk["content"]
                     yield {"type": "token", "content": chunk["content"]}
             else:
+                full_response += chunk
                 yield {"type": "token", "content": chunk}
+
+        state.add_message("assistant", full_response)
+        state.final_result = full_response
+        state.is_complete = True
+
+        self._save_user_messages_to_db(storage_messages, messages)
+        self._save_assistant_response_to_db(state)
+
+        await handler.emit(EventType.COMPLETE, state.to_dict())
+        yield {"type": "complete", "content": full_response}

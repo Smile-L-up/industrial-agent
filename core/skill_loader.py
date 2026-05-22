@@ -155,6 +155,16 @@ def _fallback_parse_yaml(yaml_text: str) -> Dict[str, Any]:
                                     result[current_key] = current_list
                                 continue
                         current_list.append(item_dict)
+                        # 检查后续更深缩进的行（列表项带值后还有子属性）
+                        if i + 1 < len(lines):
+                            next_line = lines[i + 1]
+                            next_indent = len(next_line) - len(next_line.lstrip())
+                            if next_line.strip() and next_indent > indent:
+                                sub, i = _parse_block(lines, i + 1, next_indent)
+                                item_dict.update(sub)
+                                if current_key is not None:
+                                    result[current_key] = current_list
+                                continue
                     else:
                         current_list.append(_parse_value(item_text))
                 else:
@@ -332,16 +342,20 @@ class SkillLoader:
             # ── 复合模式：无 tool.py，SKILL.md 中声明了 type: composite ──
             skill = self._create_composite_skill(skill_name, config)
         elif config and config.get("services"):
-            # ── 多服务模式：无 tool.py，SKILL.md 中声明了 services 列表 ──
-            skill = self._create_multi_service_skill(skill_name, config)
-        elif config and config.get("service"):
-            # ── 配置模式：无 tool.py，但 SKILL.md 中声明了 service ──
-            skill = self._create_service_skill(skill_name, config)
-        elif config and config.get("mcp"):
-            # ── MCP 模式：无 tool.py，但 SKILL.md 中声明了 mcp ──
-            skill = self._create_service_skill(skill_name, config)
+            # ── 服务模式：无 tool.py，SKILL.md 中声明了 services 列表 ──
+            services = config["services"]
+            if len(services) == 1:
+                # 单服务 → 创建 HttpSkill/McpSkill
+                config["service"] = services[0]
+                skill = self._create_service_skill(skill_name, config)
+            else:
+                # 多服务 → 创建 MultiServiceSkill
+                skill = self._create_multi_service_skill(skill_name, config)
+        elif config:
+            # ── Prompt 模式：无 tool.py，无 services，只有 SKILL.md ──
+            skill = self._create_prompt_skill(skill_name, config)
         else:
-            logger.error("技能 %s 既没有 tool.py 也没有 service 配置", skill_name)
+            logger.error("技能 %s 配置为空", skill_name)
             return None
 
         if skill is not None:
@@ -466,31 +480,9 @@ class SkillLoader:
         if front_matter.get("steps"):
             config["steps"] = front_matter["steps"]
 
-        # 多服务端点配置
+        # 服务配置（统一使用 services 数组）
         if front_matter.get("services"):
             config["services"] = front_matter["services"]
-
-        # 提取 HTTP 服务配置（配置模式技能）
-        service_type = front_matter.get("service_type", "")
-        if service_type in ("http", "dify"):
-            config["service"] = {
-                "type": service_type,
-                "endpoint": front_matter.get("endpoint", ""),
-                "method": front_matter.get("method", "POST"),
-                "headers": front_matter.get("headers", {}),
-                "timeout": front_matter.get("timeout", 120),
-                "inputs": front_matter.get("inputs", {}),
-                "body_template": front_matter.get("body_template", {}),
-                "response_path": front_matter.get("response_path", ""),
-            }
-        elif service_type == "mcp":
-            config["mcp"] = {
-                "endpoint": front_matter.get("endpoint", ""),
-                "timeout": front_matter.get("timeout", 120),
-            }
-            # MCP 技能也支持 inputs 配置（用于默认值、必填校验、描述覆盖）
-            if front_matter.get("inputs"):
-                config["inputs"] = front_matter["inputs"]
 
         return config
 
@@ -542,10 +534,12 @@ class SkillLoader:
 
     def _create_service_skill(self, skill_name: str, config: Dict) -> Optional[Any]:
         """
-        根据 service 配置创建 HTTP 服务技能实例（配置模式，无需 tool.py）。
+        根据 service 配置创建服务技能实例（配置模式，无需 tool.py）。
+        支持 service_type: http, dify, mcp
         """
-        service = config.get("service")
-        service_type = service.get("type", "http") if service else None
+        service = config.get("service", {})
+        # 兼容两种字段名：service_type 和 type
+        service_type = service.get("service_type") or service.get("type", "http")
 
         if service_type in ("http", "dify"):
             from core.http_skill import HttpSkill
@@ -554,7 +548,7 @@ class SkillLoader:
             except Exception as e:
                 logger.error("实例化 HTTP 技能 %s 失败：%s", skill_name, e, exc_info=True)
                 return None
-        elif service_type == "mcp" or config.get("mcp"):
+        elif service_type == "mcp":
             from core.mcp_skill import McpSkill
             try:
                 return McpSkill(config)
@@ -600,4 +594,16 @@ class SkillLoader:
             return MultiServiceSkill(config)
         except Exception as e:
             logger.error("实例化多服务技能 %s 失败：%s", skill_name, e, exc_info=True)
+            return None
+
+    def _create_prompt_skill(self, skill_name: str, config: Dict) -> Optional[Any]:
+        """
+        创建纯 Prompt 技能实例（无需 tool.py，无需 services）。
+        SKILL.md 的内容将作为 system prompt 注入到 LLM。
+        """
+        from core.prompt_skill import PromptSkill
+        try:
+            return PromptSkill(config)
+        except Exception as e:
+            logger.error("实例化 Prompt 技能 %s 失败：%s", skill_name, e, exc_info=True)
             return None

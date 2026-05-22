@@ -26,12 +26,17 @@ class HttpSkill(BaseSkill):
 
         # HTTP 服务配置
         service = config.get("service", {})
+        # 兼容两种字段名：service_type 和 type
+        self._service_type = service.get("service_type") or service.get("type", "http")
         self._endpoint = service.get("endpoint", "")
         self._method = service.get("method", "POST").upper()
         self._timeout = service.get("timeout", 120)
         self._inputs = service.get("inputs", {})
         self._body_template = service.get("body_template", {})
         self._response_path = service.get("response_path", "")
+        # Dify 智能体端点默认提取 answer 字段
+        if not self._response_path and self._service_type == "dify" and "chat-messages" in self._endpoint:
+            self._response_path = "answer"
 
         # 请求头（支持环境变量替换）
         self._headers = self._resolve_headers(service.get("headers", {}))
@@ -210,6 +215,18 @@ class HttpSkill(BaseSkill):
     def _build_body(self, params: Dict[str, Any]) -> Any:
         """根据 body_template 和参数构建请求体"""
         if not self._body_template:
+            # Dify 智能体端点（chat-messages）自动构建标准请求体
+            if self._service_type == "dify" and "chat-messages" in self._endpoint:
+                query = params.get("query", "")
+                if not query and params:
+                    query = next(iter(params.values()), "")
+                return {
+                    "inputs": {},
+                    "query": str(query),
+                    "response_mode": "blocking",
+                    "conversation_id": "",
+                    "user": "agent-user",
+                }
             return params
 
         def _fill(obj):

@@ -1,33 +1,31 @@
 ---
 name: ragflow_query
 description: "从 RAGFlow 知识库检索信息，回答知识库相关问题"
-service_type: http
-endpoint: http://192.168.110.201:9383/api/v1/retrieval
-method: POST
-headers:
-  Authorization: "Bearer ragflow-yD_aZWc9SxOSq__d9XPYEYRKhZR3Im0Ww2Rkm9T3D1w"
-timeout: 30
-inputs:
-  question:
-    type: string
-    description: 用户提出的问题
-    required: true
-body_template:
-  question: "{question}"
-  dataset_ids:
-    - "41a10475023611f1855a0242ac140006"
-  similarity_threshold: 0.1
-  vector_similarity_weight: 0.3
-  top_k: 3
-  page: 1
-  page_size: 3
-response_path: data
-keywords:
-  - 知识库
-  - RAG
-  - 检索
-  - RAGFlow
-  - 问答
+
+services:
+  - name: retrieval
+    description: "从 RAGFlow 知识库检索相关文档片段"
+    service_type: http
+    endpoint: http://192.168.110.201:9383/api/v1/retrieval
+    method: POST
+    headers:
+      Authorization: "Bearer ragflow-yD_aZWc9SxOSq__d9XPYEYRKhZR3Im0Ww2Rkm9T3D1w"
+    timeout: 30
+    inputs:
+      question:
+        type: string
+        description: 用户提出的问题
+        required: true
+    body_template:
+      question: "{question}"
+      dataset_ids:
+        - "41a10475023611f1855a0242ac140006"
+      similarity_threshold: 0.1
+      vector_similarity_weight: 0.3
+      top_k: 3
+      page: 1
+      page_size: 3
+    response_path: data
 ---
 
 # RAGFlow 知识库检索

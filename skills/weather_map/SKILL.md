@@ -1,74 +1,52 @@
 ---
 name: weather_map
 description: "生成气象色斑图（用户明确给出具体日期时使用，相对时间如'最近三天'请用 weather_map_recent）"
-keywords:
-  - 气象
-  - 色斑图
-  - 温度
-  - 降水
-  - 天气图
-  - 气温
-  - 平均温度
-  - 最高温度
-  - 最低温度
 
-# 服务类型：http（通用 HTTP）/ dify（Dify 工作流）
-service_type: dify
-
-# 服务端点
-endpoint: http://192.168.110.201:18080/v1/workflows/run
-
-# 请求方法
-method: POST
-
-# 请求头（支持环境变量 ${VAR}）
-headers:
-  Authorization: "Bearer app-MJAlwJk6Hp428NTzt5EBxBVf"
-
-# 超时时间（秒）
-timeout: 120
-
-# 输入参数定义
-inputs:
-  areaName:
-    type: string
-    description: 地区名称，如"福州市"、"厦门市"
-    required: true
-  elementType:
-    type: string
-    description: 气象要素类型，如 temAvg(平均温度)、temMax(最高温度)、temMin(最低温度)、precip(降水量)
-    required: true
-  startTime:
-    type: date
-    description: 开始日期，格式 YYYY-MM-DD
-    required: true
-  endTime:
-    type: date
-    description: 结束日期，格式 YYYY-MM-DD
-    required: true
-  statistics:
-    type: string
-    description: 统计方式，如 avg(平均)、max(最大)、min(最小)、sum(累计)
-    default: avg
-  chart_type:
-    type: string
-    description: 图表类型，如"色斑图"。
-    default: 色斑图
-
-# 请求体模板（{param} 会被替换为实际参数值）
-body_template:
-  inputs:
-    areaName: "{areaName}"
-    elementType: "{elementType}"
-    startTime: "{startTime}"
-    endTime: "{endTime}"
-    statistics: "{statistics}"
-    chart_type: "{chart_type}"
-  response_mode: blocking
-  user: "agent-user"
-
-# 响应结果提取路径（点分隔的 JSON 路径）
-response_path: data.outputs
+services:
+  - name: map
+    description: "生成气象色斑图（温度分布图、降水分布图）"
+    service_type: dify
+    endpoint: http://192.168.110.201:18080/v1/workflows/run
+    method: POST
+    headers:
+      Authorization: "Bearer app-MJAlwJk6Hp428NTzt5EBxBVf"
+    timeout: 120
+    inputs:
+      areaName:
+        type: string
+        description: 地区名称，如"福州市"、"厦门市"
+        required: true
+      elementType:
+        type: string
+        description: 气象要素类型，如 temAvg(平均温度)、temMax(最高温度)、temMin(最低温度)、precip(降水量)
+        required: true
+      startTime:
+        type: date
+        description: 开始日期，格式 YYYY-MM-DD
+        required: true
+      endTime:
+        type: date
+        description: 结束日期，格式 YYYY-MM-DD
+        required: true
+      statistics:
+        type: string
+        description: 统计方式，如 avg(平均)、max(最大)、min(最小)、sum(累计)
+        default: avg
+      chart_type:
+        type: string
+        description: 图表类型，如"色斑图"。
+        default: 色斑图
+    body_template:
+      inputs:
+        areaName: "{areaName}"
+        elementType: "{elementType}"
+        startTime: "{startTime}"
+        endTime: "{endTime}"
+        statistics: "{statistics}"
+        chart_type: "{chart_type}"
+      response_mode: blocking
+      user: "agent-user"
+    response_path: data.outputs
 ---
 
 # 气象色斑图生成
