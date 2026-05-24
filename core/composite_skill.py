@@ -167,10 +167,12 @@ class CompositeSkill(BaseSkill):
         args: Dict[str, Any],
     ) -> str:
         sub_context = self._build_sub_context(parent_context, args)
+        logger.info("[CompositeSkill] 执行子技能: %s, 参数: %s", sub_skill.name, json.dumps(args, ensure_ascii=False, default=str))
         try:
             result = await sub_skill.execute(
                 task=task, context=sub_context, messages=messages
             )
+            logger.info("[CompositeSkill] 子技能 %s 执行结果（前1000字符）: %s", sub_skill.name, str(result)[:1000])
             return str(result)
         except Exception as e:
             logger.error("子技能 %s 执行失败: %s", sub_skill.name, e, exc_info=True)

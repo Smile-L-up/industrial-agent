@@ -253,7 +253,8 @@ class HttpSkill(BaseSkill):
         import httpx
 
         logger.info("调用 HTTP 服务 [%s] %s", self._method, self._endpoint)
-        logger.debug("请求体：%s", json.dumps(body, ensure_ascii=False)[:500])
+        logger.info("[HttpSkill] 请求头：%s", json.dumps(self._headers, ensure_ascii=False))
+        logger.info("[HttpSkill] 请求体：%s", json.dumps(body, ensure_ascii=False, default=str)[:2000])
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             kwargs = {
@@ -267,19 +268,23 @@ class HttpSkill(BaseSkill):
 
             resp = await client.request(self._method, **kwargs)
 
+            logger.info("[HttpSkill] 响应内容（前2000字符）：%s", resp.text[:2000])
+
             if resp.status_code != 200:
-                logger.error("HTTP 请求失败：%d %s", resp.status_code, resp.text[:300])
+                logger.error("HTTP 请求失败：%d %s", resp.status_code, resp.text[:500])
                 return f"服务调用失败（HTTP {resp.status_code}）：{resp.text[:200]}"
 
             try:
                 data = resp.json()
             except Exception:
+                logger.info("[HttpSkill] 响应非 JSON，返回原始文本")
                 return resp.text
 
             # 按 response_path 提取结果
             if self._response_path:
                 extracted = self._extract_by_path(data, self._response_path)
                 if extracted is not None:
+                    logger.info("[HttpSkill] response_path '%s' 提取结果（前1000字符）：%s", self._response_path, str(extracted)[:1000])
                     return extracted
                 logger.warning(
                     "response_path '%s' 未匹配，返回完整响应",

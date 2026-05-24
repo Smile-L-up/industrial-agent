@@ -10,6 +10,7 @@ Skill Loader - 技能加载器
 
 import os
 import re
+import sys
 import logging
 import importlib.util
 from dataclasses import dataclass, field
@@ -294,7 +295,7 @@ class SkillLoader:
     def load_skill_full(self, skill_name: str) -> Optional[Any]:
         """
         按需加载技能的完整实现（动态导入 tool.py 并实例化）。
-        结果会缓存，同一技能不会重复加载。
+        每次调用都会重新加载，确保 SKILL.md / tool.py 的改动立即生效。
 
         Args:
             skill_name: 技能名称
@@ -302,9 +303,9 @@ class SkillLoader:
         Returns:
             BaseSkill 实例，加载失败返回 None
         """
-        # 缓存命中
-        if skill_name in self.skill_cache:
-            return self.skill_cache[skill_name]
+        # 清理旧的实例缓存和模块缓存，确保每次都重新加载
+        self.skill_cache.pop(skill_name, None)
+        self._clear_module_cache(skill_name)
 
         # 从 metadata 获取路径
         meta = self.metadata_cache.get(skill_name)
@@ -317,7 +318,7 @@ class SkillLoader:
             logger.error("技能路径不存在：%s", skill_path)
             return None
 
-        # 解析配置（如果 metadata 未缓存）
+        # 解析配置（每次重新读取 SKILL.md）
         config = self._load_config(skill_path)
         if not config and meta:
             config = {
@@ -327,7 +328,7 @@ class SkillLoader:
                 "keywords": meta.keywords,
             }
 
-        # 加载工具模块
+        # 加载工具模块（每次重新加载）
         tool_module = self._load_tool_module(skill_path, skill_name)
 
         # 注入 skill_loader 引用，供复合技能加载子技能
@@ -399,6 +400,10 @@ class SkillLoader:
         Returns:
             更新后的技能元数据列表
         """
+        # 清理所有已知技能的 Python 模块缓存
+        for name in list(self.metadata_cache.keys()):
+            self._clear_module_cache(name)
+
         self.metadata_cache.clear()
         self.skill_cache.clear()
         logger.info("已清空技能缓存，重新扫描...")
@@ -445,6 +450,16 @@ class SkillLoader:
         return set(self.metadata_cache.keys())
 
     # ==================== 内部方法 ====================
+
+    def _clear_module_cache(self, skill_name: str) -> None:
+        """
+        清理指定技能的 Python 模块缓存（sys.modules），
+        确保重新加载 tool.py 时拿到最新代码。
+        """
+        module_key = f"skills.{skill_name}.tool"
+        if module_key in sys.modules:
+            del sys.modules[module_key]
+            logger.debug("已清理模块缓存：%s", module_key)
 
     def _load_config(self, skill_path: Path) -> Optional[Dict]:
         """

@@ -93,6 +93,10 @@ class McpSkill(BaseSkill):
                 tools = await self._mcp_list_tools(client)
                 self._tools_cache = tools
 
+            # 如果指定了 tool_name 限制，校验调用方传入的工具名是否匹配
+            if self._tool_name and tool_name != self._tool_name:
+                return {"success": False, "error": f"不允许调用工具 {tool_name}，仅允许: {self._tool_name}"}
+
             tool = next((t for t in self._tools_cache if t["name"] == tool_name), None)
             if not tool:
                 return {"success": False, "error": f"MCP 工具不存在: {tool_name}"}
@@ -154,6 +158,12 @@ class McpSkill(BaseSkill):
 
             self._tools_cache = tools
 
+            # 如果指定了 tool_name，只保留匹配的工具
+            if self._tool_name:
+                tools = [t for t in tools if t.get("name") == self._tool_name]
+                if not tools:
+                    return f"MCP 服务中未找到指定工具: {self._tool_name}"
+
             # 3. 选择工具 + 提取参数
             tool_name, arguments = await self._resolve_tool_call(
                 task, messages, tools, pre_extracted=extracted
@@ -178,15 +188,18 @@ class McpSkill(BaseSkill):
                 "clientInfo": {"name": "industrial-agent", "version": "1.0.0"},
             },
         }
+        logger.info("[McpSkill] initialize 请求：%s", json.dumps(payload, ensure_ascii=False))
         resp = await client.post(
             self._endpoint,
             json=payload,
             headers={"Content-Type": "application/json; charset=utf-8"},
         )
+        logger.info("[McpSkill] initialize 响应内容：%s", resp.text[:1000])
         resp.raise_for_status()
 
         # 发送 initialized 通知
         notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        logger.info("[McpSkill] notifications/initialized 通知已发送")
         await client.post(
             self._endpoint,
             json=notification,
@@ -201,14 +214,18 @@ class McpSkill(BaseSkill):
             "id": 2,
             "params": {},
         }
+        logger.info("[McpSkill] tools/list 请求：%s", json.dumps(payload, ensure_ascii=False))
         resp = await client.post(
             self._endpoint,
             json=payload,
             headers={"Content-Type": "application/json; charset=utf-8"},
         )
+        logger.info("[McpSkill] tools/list 响应内容（前2000字符）：%s", resp.text[:2000])
         resp.raise_for_status()
         data = resp.json()
-        return data.get("result", {}).get("tools", [])
+        tools = data.get("result", {}).get("tools", [])
+        logger.info("[McpSkill] 获取到 %d 个工具", len(tools))
+        return tools
 
     async def _mcp_call_tool(
         self, client, tool_name: str, arguments: Dict[str, Any]
@@ -223,12 +240,13 @@ class McpSkill(BaseSkill):
                 "arguments": arguments,
             },
         }
-        logger.info("调用 MCP 工具: %s, 参数: %s", tool_name, arguments)
+        logger.info("[McpSkill] tools/call 请求：%s", json.dumps(payload, ensure_ascii=False, default=str)[:2000])
         resp = await client.post(
             self._endpoint,
             json=payload,
             headers={"Content-Type": "application/json; charset=utf-8"},
         )
+        logger.info("[McpSkill] tools/call 响应内容（前2000字符）：%s", resp.text[:2000])
         resp.raise_for_status()
         data = resp.json()
 
@@ -236,9 +254,12 @@ class McpSkill(BaseSkill):
         if result.get("isError"):
             contents = result.get("content", [])
             error_text = " ".join(c.get("text", "") for c in contents if c.get("type") == "text")
+            logger.error("[McpSkill] MCP 工具执行失败: %s", error_text)
             return f"MCP 工具执行失败: {error_text}"
 
-        return self._extract_content(result)
+        extracted = self._extract_content(result)
+        logger.info("[McpSkill] 提取结果（前1000字符）：%s", str(extracted)[:1000])
+        return extracted
 
     def _extract_content(self, result: Dict[str, Any]) -> Any:
         """从 MCP 响应中提取内容"""

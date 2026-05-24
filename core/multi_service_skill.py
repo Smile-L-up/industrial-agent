@@ -164,16 +164,17 @@ class MultiServiceSkill(BaseSkill):
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             # MCP initialize
-            await client.post(
-                endpoint,
-                json={
-                    "jsonrpc": "2.0", "method": "initialize", "id": 1,
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "industrial-agent", "version": "1.0.0"},
-                    },
+            init_payload = {
+                "jsonrpc": "2.0", "method": "initialize", "id": 1,
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "industrial-agent", "version": "1.0.0"},
                 },
+            }
+            logger.info("[MultiService] query_mcp_tools initialize 请求: %s", json.dumps(init_payload, ensure_ascii=False))
+            await client.post(
+                endpoint, json=init_payload,
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
             await client.post(
@@ -183,11 +184,13 @@ class MultiServiceSkill(BaseSkill):
             )
 
             # tools/list
+            list_payload = {"jsonrpc": "2.0", "method": "tools/list", "id": 2, "params": {}}
+            logger.info("[MultiService] query_mcp_tools tools/list 请求: %s", json.dumps(list_payload, ensure_ascii=False))
             resp = await client.post(
-                endpoint,
-                json={"jsonrpc": "2.0", "method": "tools/list", "id": 2, "params": {}},
+                endpoint, json=list_payload,
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
+            logger.info("[MultiService] query_mcp_tools tools/list 响应内容（前2000字符）: %s", resp.text[:2000])
             all_tools = resp.json().get("result", {}).get("tools", [])
 
         # 如果指定了 tool_name，只保留匹配的
@@ -264,7 +267,8 @@ class MultiServiceSkill(BaseSkill):
         body = self._build_body(args, body_template)
 
         logger.info("[MultiService] HTTP %s %s", method, endpoint)
-        logger.debug("[MultiService] 请求体: %s", json.dumps(body, ensure_ascii=False)[:500])
+        logger.info("[MultiService] 请求头: %s", json.dumps(headers, ensure_ascii=False))
+        logger.info("[MultiService] 请求体: %s", json.dumps(body, ensure_ascii=False, default=str)[:2000])
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             kwargs = {"url": endpoint, "headers": headers}
@@ -275,18 +279,22 @@ class MultiServiceSkill(BaseSkill):
 
             resp = await client.request(method, **kwargs)
 
+            logger.info("[MultiService] HTTP 响应内容（前2000字符）: %s", resp.text[:2000])
+
             if resp.status_code != 200:
-                logger.error("[MultiService] HTTP 失败: %d %s", resp.status_code, resp.text[:300])
+                logger.error("[MultiService] HTTP 失败: %d %s", resp.status_code, resp.text[:500])
                 return f"服务调用失败（HTTP {resp.status_code}）：{resp.text[:200]}"
 
             try:
                 data = resp.json()
             except Exception:
+                logger.info("[MultiService] 响应非 JSON，返回原始文本")
                 return resp.text
 
             if response_path:
                 extracted = self._extract_by_path(data, response_path)
                 if extracted is not None:
+                    logger.info("[MultiService] response_path '%s' 提取结果（前1000字符）: %s", response_path, str(extracted)[:1000])
                     return extracted
                 logger.warning("[MultiService] response_path '%s' 未匹配", response_path)
 
@@ -312,10 +320,12 @@ class MultiServiceSkill(BaseSkill):
                     "clientInfo": {"name": "industrial-agent", "version": "1.0.0"},
                 },
             }
-            await client.post(
+            logger.info("[MultiService] MCP initialize 请求: %s", json.dumps(init_payload, ensure_ascii=False))
+            init_resp = await client.post(
                 endpoint, json=init_payload,
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
+            logger.info("[MultiService] MCP initialize 响应内容: %s", init_resp.text[:500])
 
             # initialized notification
             await client.post(
@@ -323,40 +333,71 @@ class MultiServiceSkill(BaseSkill):
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
+            logger.info("[MultiService] MCP notifications/initialized 已发送")
 
-            # 如果没指定 tool_name，先列出工具取第一个
-            if not tool_name:
-                list_payload = {"jsonrpc": "2.0", "method": "tools/list", "id": 2, "params": {}}
-                resp = await client.post(
-                    endpoint, json=list_payload,
-                    headers={"Content-Type": "application/json; charset=utf-8"},
-                )
-                tools = resp.json().get("result", {}).get("tools", [])
-                if not tool_name and tools:
-                    tool_name = tools[0]["name"]
+            # 获取工具列表（用于自动选择 + 参数校验）
+            list_payload = {"jsonrpc": "2.0", "method": "tools/list", "id": 2, "params": {}}
+            logger.info("[MultiService] MCP tools/list 请求: %s", json.dumps(list_payload, ensure_ascii=False))
+            resp = await client.post(
+                endpoint, json=list_payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            logger.info("[MultiService] MCP tools/list 响应内容（前2000字符）: %s", resp.text[:2000])
+            tools = resp.json().get("result", {}).get("tools", [])
+
+            if not tool_name and tools:
+                tool_name = tools[0]["name"]
 
             if not tool_name:
                 return "MCP 服务未暴露任何工具"
+
+            # 参数校验：对比 MCP tool schema 中的 required 字段与实际 args
+            tool_schema = next((t for t in tools if t.get("name") == tool_name), None)
+            if tool_schema:
+                input_schema = tool_schema.get("inputSchema", {})
+                required_params = input_schema.get("required", [])
+                param_properties = input_schema.get("properties", {})
+                missing = [
+                    p for p in required_params
+                    if p not in args or args[p] in (None, "", [])
+                ]
+                if missing:
+                    descs = []
+                    for p in missing:
+                        prop = param_properties.get(p, {})
+                        desc = prop.get("description", p) if isinstance(prop, dict) else p
+                        descs.append(desc)
+                    svc_name = svc_config.get("name", tool_name)
+                    logger.warning("[MultiService] MCP 服务 %s 缺少必填参数: %s", svc_name, missing)
+                    return (
+                        f"【需要补充信息】服务「{svc_name}」调用工具「{tool_name}」时缺少必填参数，"
+                        f"需要用户提供以下信息：{', '.join(descs)}。"
+                        f"请向用户询问这些信息。"
+                    )
 
             # 调用工具
             call_payload = {
                 "jsonrpc": "2.0", "method": "tools/call", "id": 3,
                 "params": {"name": tool_name, "arguments": args},
             }
-            logger.info("[MultiService] MCP 调用 %s, 参数: %s", tool_name, args)
+            logger.info("[MultiService] MCP tools/call 请求: %s", json.dumps(call_payload, ensure_ascii=False, default=str)[:2000])
             resp = await client.post(
                 endpoint, json=call_payload,
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
+            logger.info("[MultiService] MCP tools/call 响应内容（前2000字符）: %s", resp.text[:2000])
             data = resp.json()
 
             result = data.get("result", {})
             if result.get("isError"):
                 contents = result.get("content", [])
                 error_text = " ".join(c.get("text", "") for c in contents if c.get("type") == "text")
+                logger.error("[MultiService] MCP 工具执行失败: %s", error_text)
                 return f"MCP 工具执行失败: {error_text}"
 
-            return self._extract_mcp_content(result)
+            extracted = self._extract_mcp_content(result)
+            logger.info("[MultiService] MCP 提取结果（前1000字符）: %s", str(extracted)[:1000])
+            return extracted
 
     # ── 辅助方法 ─────────────────────────────────────
 
@@ -426,6 +467,7 @@ class MultiServiceSkill(BaseSkill):
 - service 字段只能填上述"可用服务"中列出的服务名，禁止使用其他名称
 - 只选择与用户任务相关的服务，不要全部调用
 - args 中的参数值必须是具体的，不能是描述性文字
+- **重要：如果用户没有提供某个必填参数的信息，该参数值必须留空字符串 ""，不要猜测或编造，系统会自动向用户追问**
 - 严格按照"技能详细说明"中的参数填写规则来生成 args
 - 如果需要根据当前日期推算，请直接计算出具体日期
 - 今天是 {date.today().strftime("%Y-%m-%d")}
@@ -447,11 +489,12 @@ class MultiServiceSkill(BaseSkill):
 {results_text}
 
 ## 回答要求
-1. 保留所有结果中的 URL 链接（如图片地址、文件链接），不要省略
-2. 如果结果中包含色斑图、图表等可视化内容，请展示其 URL
-3. 如果结果包含报告文本，请完整引用关键内容
-4. 按服务分别展示结果，结构清晰
-5. 直接给出回答，不需要重复用户的问题"""
+1. **优先检查**：如果执行结果中包含"需要补充信息"或"缺少必填参数"，说明用户提供的信息不足，请直接、友好地向用户询问缺失的信息，不要尝试编造数据或跳过。
+2. 保留所有结果中的 URL 链接（如图片地址、文件链接），不要省略
+3. 如果结果中包含色斑图、图表等可视化内容，请展示其 URL
+4. 如果结果包含报告文本，请完整引用关键内容
+5. 按服务分别展示结果，结构清晰
+6. 直接给出回答，不需要重复用户的问题"""
 
     def _format_service_info(self, info: Dict[str, Any]) -> str:
         desc = info.get("description", "")
