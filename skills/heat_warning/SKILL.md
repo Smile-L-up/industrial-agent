@@ -3,12 +3,6 @@ name: heat_warning
 description: "重要天气-高温预警产品：自动获取气温统计数据和天气预报，判定预警等级，生成预警报告"
 
 services:
-  - name: stats
-    description: "查询市级行政区的气象要素统计数据同比，用于判定预警等级"
-    service_type: mcp
-    endpoint: http://192.168.110.201:8767/mcp/weather-forecast/mcp
-    tool_name: "查询市级行政区的气象要素统计数据同比"
-
   - name: forecast
     description: "查询市级行政区下的各区县的天气预报，用于生成逐日预报"
     service_type: mcp

@@ -70,11 +70,11 @@ class MultiServiceSkill(BaseSkill):
 
         # ── 第 1 步：LLM 规划 ──
         services_info = await self._collect_services_info()
-        plan_prompt = self._build_plan_prompt(task, services_info)
+        plan_prompt = self._build_plan_prompt(task, services_info, messages=messages)
         from llm.llm import Message
         plan_response = await llm.chat([Message(role="user", content=plan_prompt)])
         plan = self._parse_plan(plan_response.content)
-
+        logger.info("LLM 规划的原始内容（前2000字符）: %s", plan_response.content[:2000])
         if not plan:
             return plan_response.content
 
@@ -449,11 +449,44 @@ class MultiServiceSkill(BaseSkill):
 
     # ── Prompt 构建 ──────────────────────────────────
 
-    def _build_plan_prompt(self, task: str, services_info: List[Dict[str, Any]]) -> str:
+    def _build_plan_prompt(
+        self, task: str, services_info: List[Dict[str, Any]],
+        messages: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         services_desc = "\n".join(self._format_service_info(s) for s in services_info)
-        return f"""你是一个任务编排助手。根据用户任务，从可用服务中选择需要调用的服务。
 
-## 用户任务
+        # 构建对话历史上下文（最近 10 条，支持多轮参数补充）
+        history_section = ""
+        if messages and len(messages) > 1:
+            history_lines = []
+            for msg in messages[-10:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [
+                        item.get("text", "") for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    ]
+                    content = " ".join(text_parts)
+                if isinstance(content, str) and content.strip():
+                    display = content.strip()
+                    if len(display) > 300:
+                        display = display[:300] + "..."
+                    history_lines.append(f"{role}: {display}")
+            if history_lines:
+                history_section = "\n".join(history_lines)
+                logger.info("[MultiService] 规划 prompt 包含 %d 条最近对话: %s", len(history_lines), [line[:80] for line in history_lines])
+            else:
+                logger.warning("[MultiService] messages 有 %d 条但解析后为空", len(messages))
+        else:
+            logger.info("[MultiService] 无对话历史（messages=%s）", "None" if messages is None else f"{len(messages)}条")
+
+        return f"""你是一个任务编排助手。根据用户任务，从可用服务中选择需要调用的服务并填写参数。
+
+## 对话历史
+{history_section if history_section else "（无历史对话）"}
+
+## 当前用户输入
 {task}
 
 ## 可用服务
@@ -463,14 +496,19 @@ class MultiServiceSkill(BaseSkill):
 输出一个 JSON 数组，每个元素代表一个服务调用：
 [{{"service": "服务名", "args": {{"参数名": "参数值"}}, "description": "步骤说明"}}]
 
-注意：
+## 重要：参数填写规则
+你必须严格按照以下优先级填写 args 中的参数值：
+1. **先看当前用户输入**：从"{task}"中提取能匹配的参数值
+2. **再看对话历史**：如果当前输入不够，仔细检查"对话历史"中用户之前提到的信息。例如：用户之前说过"泉州"，那 areaCode 就应该是"泉州"
+3. **日期推算**：日期类参数如果用户未指定，根据今天 {date.today().strftime("%Y-%m-%d")} 合理推算
+4. **留空规则**：只有当用户在当前输入和对话历史中都没有提供某个必填参数时，才留空字符串 ""
+
+**关键提醒**：对话历史中的信息是用户明确提供的，必须被使用。不要忽略历史中已有的参数值。
+
+其他注意：
 - service 字段只能填上述"可用服务"中列出的服务名，禁止使用其他名称
 - 只选择与用户任务相关的服务，不要全部调用
-- args 中的参数值必须是具体的，不能是描述性文字
-- **重要：如果用户没有提供某个必填参数的信息，该参数值必须留空字符串 ""，不要猜测或编造，系统会自动向用户追问**
-- 严格按照"技能详细说明"中的参数填写规则来生成 args
-- 如果需要根据当前日期推算，请直接计算出具体日期
-- 今天是 {date.today().strftime("%Y-%m-%d")}
+- args 中的参数值必须是具体的值，不能是描述性文字
 - 只输出 JSON 数组，不要输出其他内容"""
 
     def _build_answer_prompt(self, task: str, results: List[Dict[str, Any]]) -> str:

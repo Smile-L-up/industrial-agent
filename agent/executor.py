@@ -339,7 +339,8 @@ class Executor:
                 yield {"type": "error", "content": "未配置任何服务端点"}
                 return
 
-            plan_prompt = skill._build_plan_prompt(state.current_task.description, services_info)
+            logger.info("[executor] 多服务规划，state.messages 长度: %d", len(state.messages) if state.messages else 0)
+            plan_prompt = skill._build_plan_prompt(state.current_task.description, services_info, messages=state.messages)
             plan_response = await self.llm.chat([Message(role="user", content=plan_prompt)])
             plan = skill._parse_plan(plan_response.content)
 
@@ -370,7 +371,7 @@ class Executor:
                     "type": "tool_call",
                     "name": service_name,
                     "service_type": "service",
-                    "args": {"step": f"{i + 1}/{len(plan)}", "description": desc},
+                    "args": args,
                 }
 
                 svc_config = skill._find_service(service_name)

@@ -344,14 +344,8 @@ class SkillLoader:
             skill = self._create_composite_skill(skill_name, config)
         elif config and config.get("services"):
             # ── 服务模式：无 tool.py，SKILL.md 中声明了 services 列表 ──
-            services = config["services"]
-            if len(services) == 1:
-                # 单服务 → 创建 HttpSkill/McpSkill
-                config["service"] = services[0]
-                skill = self._create_service_skill(skill_name, config)
-            else:
-                # 多服务 → 创建 MultiServiceSkill
-                skill = self._create_multi_service_skill(skill_name, config)
+            # 统一走 MultiServiceSkill（支持 LLM 规划 + 参数校验 + 缺参追问）
+            skill = self._create_multi_service_skill(skill_name, config)
         elif config:
             # ── Prompt 模式：无 tool.py，无 services，只有 SKILL.md ──
             skill = self._create_prompt_skill(skill_name, config)

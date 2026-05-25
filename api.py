@@ -549,7 +549,10 @@ async def chat(request: ChatRequest):
                 elif isinstance(content, str):
                     query_text = content
                 break
-        
+
+        logger.info("[chat] 用户输入：%s", query_text.strip())
+        logger.info("[chat] 会话ID：%s，模型：%s，selected_skills：%s", actual_session_id, request.model, request.selected_skills)
+
         # 收集 OpenAI 兼容参数
         llm_kwargs = _collect_llm_kwargs(request)
         
@@ -647,7 +650,22 @@ async def chat_stream(request: ChatRequest):
     """
     if not app_state["initialized"]:
         raise HTTPException(status_code=503, detail="系统正在初始化中")
-    
+
+    # 提取并打印用户输入
+    query_text = ""
+    for msg in request.messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        query_text += item.get("text", "") + " "
+            elif isinstance(content, str):
+                query_text = content
+            break
+    logger.info("[chat_stream] 用户输入：%s", query_text.strip())
+    logger.info("[chat_stream] 会话ID：%s，模型：%s，selected_skills：%s", request.session_id, request.model, request.selected_skills)
+
     # 收集 OpenAI 兼容参数
     llm_kwargs = _collect_llm_kwargs(request)
 
